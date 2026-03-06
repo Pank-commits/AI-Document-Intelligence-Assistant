@@ -1,0 +1,14 @@
+﻿flask
+qdrant-client
+sentence-transformers
+langchain-community
+langchain-core
+langchain-text-splitters
+python-docx
+pandas
+openpyxl
+numpy
+rank-bm25
+pymupdf4llm
+openai
+protobuf>=3.20.3,<5

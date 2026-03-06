@@ -1,0 +1,235 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>File RAG Assistant</title>
+  <style>
+    body {
+      font-family: "Segoe UI", Arial, sans-serif;
+      background: #5c7eb3;
+      color: #1f2937;
+      margin: 0;
+      padding: 0;
+    }
+
+    .container {
+      max-width: 900px;
+      margin: 40px auto;
+      background: hwb(0 98% 2%);
+      padding: 30px;
+      border-radius: 10px;
+      box-shadow: 0 0 20px rgba(0,0,0,0.1);
+    }
+
+    h1 {
+      text-align: center;
+      color: #2c3e50;
+    }
+
+    h2 {
+      color: #34495e;
+      margin-top: 30px;
+    }
+    .session-meta {
+      margin-top: 10px;
+      font-size: 14px;
+      color: #475569;
+    }
+
+    input[type="file"],
+    input[type="text"] {
+      width: 100%;
+      padding: 12px;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      margin-top: 10px;
+      font-size: 15px;
+    }
+
+    button {
+      background: #4f46e5;
+      color: white;
+      border: none;
+      padding: 10px 18px;
+      border-radius: 6px;
+      font-size: 15px;
+      cursor: pointer;
+      margin-top: 10px;
+    }
+
+    button:hover {
+      background: #4338ca;
+    }
+
+    #status {
+      margin-top: 10px;
+      font-weight: bold;
+      color: green;
+    }
+
+    .answer-box {
+      background: #f9fafb;
+      color: #111827;
+      border-left: 4px solid #4f46e5;
+      padding: 15px;
+      margin-top: 15px;
+      border-radius: 6px;
+      white-space: pre-wrap;
+    }
+
+    #files-list {
+      color: #1f2937;
+    }
+
+    .footer {
+      text-align: center;
+      margin-top: 40px;
+      color: #888;
+      font-size: 14px;
+    }
+  </style>
+</head>
+
+<body>
+
+  <div class="container">
+    <h1>Multi-File RAG Assistant</h1>
+
+    <h2>Upload Files</h2>
+    <input type="file" id="files" multiple>
+    <button onclick="uploadFiles()">Upload</button>
+    <p id="status"></p>
+    <div id="session-meta" class="session-meta">Session ID: Not started</div>
+
+    <h2>Ask a Question</h2>
+    <input type="text" id="query" placeholder="Ask something like: What is machine learning and how many casual leaves are allowed?">
+    <button onclick="ask()">Ask</button>
+
+    <div id="answer" class="answer-box"></div>
+    <h2>Uploaded Files</h2>
+    <button onclick="loadFiles()">Refresh Files List</button>
+    <div id="files-list" style="margin-top:10px;"></div>
+
+    <div class="footer">
+      Built with Flask | Qdrant | RAG | OpenAI
+    </div>
+  </div>
+
+  <script>
+    function updateSessionMeta(sessionId) {
+      const meta = document.getElementById("session-meta");
+      meta.innerText = sessionId ? `Session ID: ${sessionId}` : "Session ID: Not started";
+    }
+
+    function uploadFiles() {
+      const filesInput = document.getElementById("files");
+      const formData = new FormData();
+
+      if (filesInput.files.length === 0) {
+        document.getElementById("status").innerText = "Please select files first!";
+        return;
+      }
+
+      for (let file of filesInput.files) {
+        formData.append("files", file);
+      }
+
+      document.getElementById("status").innerText = "Uploading...";
+
+      fetch("/upload", {
+        method: "POST",
+        body: formData
+      })
+      .then(res => res.json())
+      .then(data => {
+        document.getElementById("status").innerText = data.message || "Upload successful!";
+        updateSessionMeta(data.session_id);
+      })
+      .catch(err => {
+        document.getElementById("status").innerText = "Upload failed!";
+      });
+    }
+
+    function ask() {
+      const q = document.getElementById("query").value;
+
+      if (!q.trim()) {
+        alert("Please enter a question.");
+        return;
+      }
+
+      document.getElementById("answer").innerText = "Thinking...";
+
+      fetch("/query?ts=" + Date.now(), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-cache"
+        },
+        body: JSON.stringify({query: q})
+      })
+      .then(res => res.json())
+      .then(data => {
+        document.getElementById("answer").innerText = data.answer;
+      })
+      .catch(err => {
+        document.getElementById("answer").innerText = "Error getting answer!";
+      });
+    }
+
+
+    function loadFiles(){
+
+       fetch("/files")
+      .then(res => res.json())
+      .then(data => {
+       updateSessionMeta(data.session_id);
+
+       const box = document.getElementById("files-list");
+       box.innerHTML = "";
+
+       if(data.files.length === 0){
+        box.innerHTML = "<p>No files uploaded.</p>";
+        return;
+       }
+
+       data.files.forEach(file => {
+
+        const div = document.createElement("div");
+        div.style.margin = "6px 0";
+
+        div.innerHTML = `
+          File: ${file}
+          <button style="margin-left:10px" onclick="deleteFile('${file}')">Delete</button>
+        `;
+
+        box.appendChild(div);
+      });
+
+    });
+}
+
+
+    function deleteFile(filename){
+
+      if(!confirm("Delete " + filename + " ?")) return;
+
+      fetch("/delete_file", {
+       method: "POST",
+       headers: {"Content-Type": "application/json"},
+       body: JSON.stringify({filename: filename})
+      })
+      .then(res => res.json())
+      .then(data => {
+        alert(data.message);
+        loadFiles();
+      });
+
+  }
+
+    window.addEventListener("DOMContentLoaded", loadFiles);
+
+  </script>
+
+</body>
+</html>
