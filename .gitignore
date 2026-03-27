@@ -1,0 +1,9 @@
+.venv/
+.vscode/
+__pycache__/
+*.pyc
+*.log
+codex_cookies.txt
+test_session.cookies
+uploads/
+Static/chart_*.png

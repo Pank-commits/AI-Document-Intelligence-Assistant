@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 from langchain_core.documents import Document
 
+from qdrant_compat import vector_search
 from retriever import reciprocal_rank_fusion, rerank
 
 
@@ -22,6 +23,31 @@ def _safe_float(value, default=0.0):
         return float(default)
 
 
+def _metadata_matches_filter(metadata, metadata_filter):
+    if not metadata_filter:
+        return True
+
+    for key, value in metadata_filter.items():
+        target = str(value or "").strip().lower()
+        if not target:
+            continue
+
+        direct = str((metadata or {}).get(key) or "").strip().lower()
+        if direct == target:
+            continue
+
+        plural_key = f"{key}s"
+        multi_values = (metadata or {}).get(plural_key) or []
+        if isinstance(multi_values, (list, tuple, set)):
+            normalized = {str(item).strip().lower() for item in multi_values if item}
+            if target in normalized:
+                continue
+
+        return False
+
+    return True
+
+
 def hybrid_retrieve(
     query,
     session_id,
@@ -32,18 +58,20 @@ def hybrid_retrieve(
     session_hybrid_index=None,
     use_expansion=True,
     expand_query_fn=None,
-    vector_limit=25,
+    vector_limit=15,
     final_top_k=8,
     collect_debug=False,
     encode_query_fn=None,
+    metadata_filter=None,
 ):
+    """Run Vector Search + BM25 retrieval, fuse candidates, then rerank."""
     t_start = time.perf_counter()
     debug_meta = {
         "stages_ms": {},
         "retrieval_queries_count": 1,
         "retrieval_queries": [query],
         "vector_hits": 0,
-        "keyword_hits": 0,
+        "bm25_hits": 0,
         "fused_docs": 0,
     }
 
@@ -57,22 +85,38 @@ def hybrid_retrieve(
 
     t_vector = time.perf_counter()
     vector_hit_map = {}
+    query_filter = {
+        "must": [
+            {"key": "session_id", "match": {"value": session_id}},
+        ]
+    }
+    for key, value in (metadata_filter or {}).items():
+        if value is not None:
+            if key in {"country", "product"}:
+                query_filter["must"].append(
+                    {
+                        "should": [
+                            {"key": key, "match": {"value": value}},
+                            {"key": f"{key}s", "match": {"value": value}},
+                        ]
+                    }
+                )
+            else:
+                query_filter["must"].append({"key": key, "match": {"value": value}})
+
     for rq in retrieval_queries:
         if callable(encode_query_fn):
             encoded = encode_query_fn(rq)
             query_embedding = encoded.tolist() if hasattr(encoded, "tolist") else encoded
         else:
             query_embedding = model.encode(rq, normalize_embeddings=True).tolist()
-        hits = qdrant.search(
+        hits = vector_search(
+            qdrant,
             collection_name=collection_name,
             query_vector=query_embedding,
             limit=vector_limit,
             with_payload=True,
-            query_filter={
-                "must": [
-                    {"key": "session_id", "match": {"value": session_id}},
-                ]
-            },
+            query_filter=query_filter,
         )
         for hit in hits:
             chunk_id = hit.payload.get("chunk_id")
@@ -102,12 +146,14 @@ def hybrid_retrieve(
         keyword_doc_map = {}
         for rq in retrieval_queries:
             for doc, score in session_hybrid_index.keyword_search(rq, k=vector_limit):
+                if not _metadata_matches_filter(doc.metadata, metadata_filter):
+                    continue
                 chunk_id = doc.metadata.get("chunk_id")
                 if chunk_id not in keyword_doc_map or score > keyword_doc_map[chunk_id][1]:
                     keyword_doc_map[chunk_id] = (doc, score)
         keyword_docs = sorted(keyword_doc_map.values(), key=lambda x: x[1], reverse=True)[:vector_limit]
-    debug_meta["stages_ms"]["keyword_search"] = round((time.perf_counter() - t_keyword) * 1000, 2)
-    debug_meta["keyword_hits"] = len(keyword_docs)
+    debug_meta["stages_ms"]["bm25_search"] = round((time.perf_counter() - t_keyword) * 1000, 2)
+    debug_meta["bm25_hits"] = len(keyword_docs)
 
     t_rerank = time.perf_counter()
     fused_docs = reciprocal_rank_fusion(vector_docs, keyword_docs)
@@ -118,8 +164,9 @@ def hybrid_retrieve(
     results = []
     for d in final_docs:
         rerank_score = _safe_float(d.metadata.get("rerank_score_norm"), 0.0)
+        keyword_score = _safe_float(d.metadata.get("keyword_score"), 0.0)
         rrf_score = _safe_float(d.metadata.get("rrf_score"), 0.0)
-        final_score = (rerank_score * 0.7) + (rrf_score * 0.3)
+        final_score = (rerank_score * 0.5) + (keyword_score * 0.2) + (rrf_score * 0.3)
 
         raw_score = d.metadata.get("rerank_score_norm")
 
@@ -135,6 +182,7 @@ def hybrid_retrieve(
                     **d.metadata, 
                     "text": d.page_content,
                     "rerank_score": rerank_score,
+                    "keyword_score": keyword_score,
                     "rrf_score": rrf_score,
                     "final_score": final_score
                 },
@@ -143,7 +191,7 @@ def hybrid_retrieve(
             )
         )
 
-    logging.info(f"Hybrid retrieval returned {len(results)} results")
+    logging.info(f"Vector Search + BM25 retrieval returned {len(results)} results")
     debug_meta["stages_ms"]["total_retrieval"] = round((time.perf_counter() - t_start) * 1000, 2)
     if collect_debug:
         return results, retrieval_queries, debug_meta
