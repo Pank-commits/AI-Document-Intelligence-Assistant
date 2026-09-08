@@ -5,5 +5,7 @@ __pycache__/
 *.log
 codex_cookies.txt
 test_session.cookies
+query_body.json
+test_query.json
 uploads/
 Static/chart_*.png

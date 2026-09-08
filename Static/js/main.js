@@ -101,8 +101,7 @@ if (!Array.isArray(chartData) || !chartData.length) {
 return
 }
 
-const body = msg.querySelector(".message-body")
-if (!body) {
+if (!msg) {
 return
 }
 
@@ -110,7 +109,7 @@ let container = msg.querySelector(".chart-container")
 if (!container) {
 container = document.createElement("div")
 container.className = "chart-container"
-body.appendChild(container)
+ msg.appendChild(container)
 }
 
 const serializedData = JSON.stringify(chartData)
@@ -1017,6 +1016,15 @@ setMessageText(msg, err.message || "Unable to reach backend.")
 }
 
 document.addEventListener("click", event => {
+const brokenLink = event.target.closest("a")
+if (brokenLink) {
+const href = String(brokenLink.getAttribute("href") || "").trim()
+if (!href || href === "undefined" || href === "/undefined") {
+event.preventDefault()
+console.warn("Blocked broken navigation target:", href || "(empty)")
+return
+}
+}
 if (!event.target.closest(".history-actions")) {
 closeHistoryMenus()
 }

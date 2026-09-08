@@ -712,9 +712,80 @@ def load_csv_excel(file_path: str, ext: str) -> list[LangDocument]:
 
     return blocks
 
+
+def load_csv_excel_reduced(file_path: str, ext: str, sample_rows: int = 400) -> list[LangDocument]:
+    """Build a very small semantic footprint for large tabular uploads."""
+    read_kwargs = {"nrows": sample_rows}
+    df = pd.read_csv(file_path, **read_kwargs) if ext == "csv" else pd.read_excel(file_path, **read_kwargs)
+    df = _clean_tabular_dataframe(df)
+    if df.empty:
+        return []
+
+    row_count = len(df)
+    blocks = []
+    base_meta = {
+        **_extract_representative_metadata(df),
+        "rows": "reduced_summary",
+        "total_rows": row_count,
+        "semantic_rows_indexed": min(sample_rows, row_count),
+        "semantic_blocks_total": 1,
+        "semantic_blocks_indexed": 1,
+        "semantic_index_capped": True,
+        "chunk_rows": row_count,
+        "chunk_kind": "dataset_summary",
+        "special_chunk": True,
+        "reduced_semantic_load": True,
+    }
+
+    global_summary_text = add_global_summary(df)
+    if global_summary_text:
+        blocks.append(
+            LangDocument(
+                page_content=enhance_chunk("\n".join([add_schema_context(df), global_summary_text])),
+                metadata={**base_meta, "rows": "global_summary", "chunk_kind": "global_summary"},
+            )
+        )
+
+    blocks.append(
+        LangDocument(
+            page_content=enhance_chunk(
+                "\n".join(filter(None, [add_schema_context(df), _build_dataset_summary_text(df), build_chunk_text(df)]))
+            ),
+            metadata=base_meta,
+        )
+    )
+
+    sample_slices = [("Sample rows", df.head(min(25, len(df))))]
+    if len(df) > 25:
+        sample_slices.append(("Recent sample rows", df.tail(min(25, len(df)))))
+
+    for label, part in sample_slices:
+        if part.empty:
+            continue
+        blocks.append(
+            LangDocument(
+                page_content=_build_block_text(part.copy(), block_label=label),
+                metadata={
+                    **_extract_representative_metadata(part),
+                    "rows": label.lower().replace(" ", "_"),
+                    "total_rows": row_count,
+                    "semantic_rows_indexed": len(part),
+                    "semantic_blocks_total": len(sample_slices),
+                    "semantic_blocks_indexed": len(sample_slices),
+                    "semantic_index_capped": True,
+                    "chunk_rows": len(part),
+                    "chunk_kind": "data_block",
+                    "special_chunk": False,
+                    "reduced_semantic_load": True,
+                },
+            )
+        )
+
+    return blocks
+
 # MAIN ENTRY
 
-def load_and_chunk_file(file_path: str) -> list[LangDocument]:
+def load_and_chunk_file(file_path: str, reduced_tabular_semantic: bool = False) -> list[LangDocument]:
 
 
     ext = os.path.splitext(file_path)[1].lower().replace(".", "")
@@ -727,7 +798,7 @@ def load_and_chunk_file(file_path: str) -> list[LangDocument]:
     elif ext == "docx":
         docs = load_docx(file_path)
     elif ext in ["csv", "xls", "xlsx"]:
-        docs = load_csv_excel(file_path, ext)
+        docs = load_csv_excel_reduced(file_path, ext) if reduced_tabular_semantic else load_csv_excel(file_path, ext)
     else:
         raise ValueError(f"Unsupported file format: {ext}")
 
@@ -778,9 +849,9 @@ def load_and_chunk_file(file_path: str) -> list[LangDocument]:
     return final_chunks
 
 
-def load_file(file_path: str) -> list[LangDocument]:
+def load_file(file_path: str, reduced_tabular_semantic: bool = False) -> list[LangDocument]:
     """Backward-compatible entrypoint used by app.py."""
-    return load_and_chunk_file(file_path)
+    return load_and_chunk_file(file_path, reduced_tabular_semantic=reduced_tabular_semantic)
 
 
 

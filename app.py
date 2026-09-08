@@ -7,6 +7,7 @@ os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import warnings
 warnings.filterwarnings("ignore")
+
 # -------------------------------------
 
 """
@@ -46,6 +47,7 @@ from flask import (
     Response,
     stream_with_context,
     url_for)
+from werkzeug.exceptions import HTTPException
 from werkzeug.utils import secure_filename
 from qdrant_client.models import (
     PointStruct, 
@@ -132,6 +134,8 @@ QDRANT_TIMEOUT = float(os.getenv("QDRANT_TIMEOUT", "120"))
 QDRANT_UPSERT_BATCH_SIZE = int(os.getenv("QDRANT_UPSERT_BATCH_SIZE", "256"))
 QDRANT_UPSERT_MAX_RETRIES = int(os.getenv("QDRANT_UPSERT_MAX_RETRIES", "3"))
 EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "128"))
+TABULAR_MULTI_FILE_REDUCED_INDEX_THRESHOLD = int(os.getenv("TABULAR_MULTI_FILE_REDUCED_INDEX_THRESHOLD", "4"))
+TABULAR_MULTI_FILE_SEMANTIC_CHUNKS_PER_FILE = int(os.getenv("TABULAR_MULTI_FILE_SEMANTIC_CHUNKS_PER_FILE", "6"))
 
 
 def init_embedding_model():
@@ -460,6 +464,16 @@ def process_upload_job(session_id, files_to_process, upload_time):
         all_payloads = []
         indexed_files = []
         tabular_caps = []
+        all_tabular_batch = bool(files_to_process) and all(f.get("data_mode") == "tabular" for f in files_to_process)
+        reduced_tabular_semantic_indexing = (
+            all_tabular_batch and len(files_to_process) >= TABULAR_MULTI_FILE_REDUCED_INDEX_THRESHOLD
+        )
+        if reduced_tabular_semantic_indexing:
+            logging.info(
+                "Reduced semantic indexing enabled for tabular batch: files=%s chunks_per_file=%s",
+                len(files_to_process),
+                TABULAR_MULTI_FILE_SEMANTIC_CHUNKS_PER_FILE,
+            )
 
         for idx, file_info in enumerate(files_to_process, start=1):
             safe_name = file_info["safe_name"]
@@ -479,7 +493,10 @@ def process_upload_job(session_id, files_to_process, upload_time):
             conversation_memory["data_mode"] = data_mode
 
             parse_started_at = time.perf_counter()
-            chunks: list[Document] = load_file(path)
+            chunks: list[Document] = load_file(
+                path,
+                reduced_tabular_semantic=(reduced_tabular_semantic_indexing and data_mode == "tabular"),
+            )
             parse_elapsed = time.perf_counter() - parse_started_at
             sections = {}
             if not safe_name.lower().endswith((".csv", ".xlsx", ".xls")):
@@ -546,6 +563,14 @@ def process_upload_job(session_id, files_to_process, upload_time):
 
             for chunk_idx, c in enumerate(chunks):
                 meta = normalize_metadata(getattr(c, "metadata", {}), path, chunk_idx)
+                if reduced_tabular_semantic_indexing and data_mode == "tabular":
+                    chunk_kind = str(meta.get("chunk_kind") or "")
+                    if meta.get("special_chunk"):
+                        pass
+                    elif chunk_kind in {"global_summary", "dataset_summary"}:
+                        pass
+                    elif chunk_idx >= TABULAR_MULTI_FILE_SEMANTIC_CHUNKS_PER_FILE:
+                        continue
                 chunk_id = str(
                     uuid.uuid5(
                         uuid.NAMESPACE_URL,
@@ -594,6 +619,26 @@ def process_upload_job(session_id, files_to_process, upload_time):
         logging.info(
             f"Loaded {len(all_texts)} text chunks from {len(set(p['file'] for p in all_payloads))} files"
         )
+        if all_tabular_batch:
+            remove_session_index(session_id)
+            total_elapsed = time.perf_counter() - job_started_at
+            logging.info(
+                "Tabular upload completed without semantic indexing: files=%s total_elapsed=%s",
+                len(files_to_process),
+                format_duration(total_elapsed),
+            )
+            update_session_upload_status(
+                session_id,
+                state="ready",
+                message=f"{len(files_to_process)} tabular file(s) prepared successfully.",
+                current_file=None,
+                chunks_prepared=0,
+                chunks_indexed=0,
+                finished_at=time.time(),
+                error=None,
+                reduced_tabular_semantic_indexing=False,
+            )
+            return
         if not all_payloads:
             raise ValueError("No valid files to index.")
 
@@ -604,6 +649,7 @@ def process_upload_job(session_id, files_to_process, upload_time):
             message=f"Embedding {len(all_texts)} chunks",
             chunks_prepared=len(all_texts),
             chunks_indexed=0,
+            reduced_tabular_semantic_indexing=reduced_tabular_semantic_indexing,
         )
         vectors = model.encode(
             all_texts,
@@ -657,6 +703,7 @@ def process_upload_job(session_id, files_to_process, upload_time):
             chunks_indexed=len(points),
             finished_at=time.time(),
             error=None,
+            reduced_tabular_semantic_indexing=reduced_tabular_semantic_indexing,
         )
     except Exception as exc:
         logging.exception("UnhandledException during upload job")
@@ -1427,7 +1474,7 @@ def detect_visualization(query, context):
 
 def get_chart_type(query):
     q = query.lower()
-    if "trend" in q or "over time" in q or "by year" in q or "monthly" in q or "yearly" in q:
+    if any(token in q for token in ["trend", "over time", "by year", "monthly", "yearly", "daily", "weekly", "quarterly", "by month", "by week", "by day", "qoq", "yoy"]):
         return "line"
     elif "distribution" in q or "percentage" in q or "share" in q:
         return "pie"
@@ -1445,6 +1492,23 @@ def detect_visualization(query, context):
 
     strong_patterns = ["distribution", "percentage", "share", "breakdown", "trend", "over time"]
     return any(pattern in q for pattern in strong_patterns)
+
+
+def should_attach_tabular_chart(query):
+    """Return True for tabular questions where a visual is likely helpful."""
+    q = (query or "").lower()
+    visual_terms = ["chart", "graph", "plot", "visualize", "visualise", "dashboard"]
+    if any(term in q for term in visual_terms):
+        return True
+    helpful_patterns = [
+        "trend", "over time", "by ", "per ", "grouped by", "breakdown", "distribution",
+        "contribution", "compare", "comparison", "top ", "highest", "lowest", "most", "least",
+        "monthly", "weekly", "daily", "quarterly", "yearly", "yoy", "qoq"
+    ]
+    blocking_patterns = ["why ", "how ", "explain", "definition", "define", "meaning"]
+    if any(pattern in q for pattern in blocking_patterns):
+        return False
+    return any(pattern in q for pattern in helpful_patterns)
 
 
 def should_generate_chart(query, data, context):
@@ -1471,6 +1535,245 @@ def should_generate_chart(query, data, context):
     return any(term in q for term in explicit_chart_terms) or any(pattern in q for pattern in strong_visual_patterns)
 
 
+def resolve_chart_data_from_dataframe(query, dataframe):
+    """Resolve chart data using answer-like metric, filter, grouping, and time logic."""
+    if dataframe is None or dataframe.empty:
+        return []
+
+    q = (query or "").strip().lower()
+    q = re.sub(r"\s+", " ", q)
+
+    chart_phrase_aliases = [
+        (r"\bcountry wise\b", "by country"),
+        (r"\bregion wise\b", "by region"),
+        (r"\bproduct wise\b", "by product"),
+        (r"\bcategory wise\b", "by category"),
+        (r"\bcompany wise\b", "by company"),
+        (r"\bsales graph\b", "sales chart"),
+        (r"\brevenue graph\b", "revenue chart"),
+        (r"\bprofit graph\b", "profit chart"),
+        (r"\bcountry wise sales\b", "sales by country"),
+        (r"\bregion wise sales\b", "sales by region"),
+        (r"\bproduct wise sales\b", "sales by product"),
+        (r"\bmarket share country wise\b", "market share by country"),
+        (r"\bshow market share trend\b", "market share over time"),
+        (r"\brecent sales trend\b", "sales trend over time"),
+    ]
+    for pattern, replacement in chart_phrase_aliases:
+        q = re.sub(pattern, replacement, q)
+
+    working_df = dataframe.copy()
+    working_df.columns = [str(c).strip().lower() for c in working_df.columns]
+    cols_lower = {str(c).lower(): c for c in working_df.columns}
+
+    def find_col(*keywords):
+        for lower, orig in cols_lower.items():
+            if all(k in lower for k in keywords):
+                return orig
+        for keyword in keywords:
+            for lower, orig in cols_lower.items():
+                if keyword in lower:
+                    return orig
+        return None
+
+    def infer_value_from_column(text_col):
+        if not text_col or text_col not in working_df.columns:
+            return None
+        series = working_df[text_col].dropna().astype(str).str.strip()
+        candidates = sorted({s.lower() for s in series if s}, key=len, reverse=True)
+        for cand in candidates[:500]:
+            if cand and cand in q:
+                return cand
+        return None
+
+    def apply_text_filter(frame, col_name, expected_substring):
+        if not col_name or not expected_substring or col_name not in frame.columns:
+            return frame
+        return frame[
+            frame[col_name].astype(str).str.lower().str.contains(re.escape(expected_substring), na=False)
+        ]
+
+    def detect_relative_time_window(text):
+        patterns = [
+            r"\b(?:last|past|previous|recent)\s+(\d+)\s+(day|days|week|weeks|month|months|year|years)\b",
+            r"\b(\d+)\s+(day|days|week|weeks|month|months|year|years)\s+(?:back|prior|ago)\b",
+            r"\btrailing\s+(\d+)\s+(day|days|week|weeks|month|months|year|years)\b",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                return int(match.group(1)), match.group(2).lower()
+        return None
+
+    def relative_window_start(end_date, amount, unit):
+        if unit.startswith("day"):
+            return end_date - pd.Timedelta(days=amount)
+        if unit.startswith("week"):
+            return end_date - pd.Timedelta(weeks=amount)
+        if unit.startswith("month"):
+            return end_date - pd.DateOffset(months=amount)
+        if unit.startswith("year"):
+            return end_date - pd.DateOffset(years=amount)
+        return None
+
+    def detect_time_granularity(text):
+        if any(token in text for token in ["daily", "by day", "per day", "day wise", "day-wise"]):
+            return "day"
+        if any(token in text for token in ["weekly", "by week", "per week", "week wise", "week-wise"]):
+            return "week"
+        if any(token in text for token in ["monthly", "by month", "per month", "month wise", "month-wise", "trend", "over time"]):
+            return "month"
+        if any(token in text for token in ["quarterly", "by quarter", "per quarter", "quarter wise", "quarter-wise", "qoq"]):
+            return "quarter"
+        if any(token in text for token in ["yearly", "annual", "annually", "by year", "per year", "yoy"]):
+            return "year"
+        return None
+
+    def resolve_dimension_column(frame, text):
+        alias_groups = {
+            "country": ["country", "countries", "nation", "location"],
+            "region": ["region", "regions", "territory", "area", "geography"],
+            "city": ["city", "cities"],
+            "gender": ["gender", "sex"],
+            "market": ["market", "markets"],
+            "product": ["product", "products", "item", "items"],
+            "category": ["category", "categories"],
+            "sub_category": ["sub-category", "subcategory", "sub category"],
+            "customer": ["customer", "customers", "client", "clients"],
+            "segment": ["segment", "segments"],
+            "department": ["department", "departments"],
+            "division": ["division", "divisions"],
+            "brand": ["brand", "brands"],
+            "sku": ["sku", "skus"],
+            "supplier": ["supplier", "suppliers"],
+            "vendor": ["vendor", "vendors"],
+            "campaign": ["campaign", "campaigns"],
+            "channel": ["channel", "channels", "sales channel"],
+            "platform": ["platform", "platforms"],
+            "store": ["store", "stores"],
+            "branch": ["branch", "branches"],
+            "employee": ["employee", "employees", "salesperson", "salespeople", "staff"],
+            "project": ["project", "projects"],
+            "company": ["company", "companies", "firm"],
+        }
+        local_lower = {str(col).lower(): col for col in frame.columns}
+        for canonical, aliases in alias_groups.items():
+            if not any(alias in text for alias in aliases):
+                continue
+            for alias in aliases + [canonical]:
+                for lower, orig in local_lower.items():
+                    if alias in lower:
+                        return canonical, orig
+        return None, None
+
+    def tokenize_text(text):
+        return [token for token in re.findall(r"[a-z0-9]+", str(text or "").lower()) if token]
+
+    def detect_generic_metric_column(frame):
+        query_tokens_local = set(tokenize_text(q))
+        best_col = None
+        best_score = 0.0
+        for col in frame.columns:
+            series = frame[col].dropna()
+            if series.empty:
+                continue
+            numeric_score = 1.0 if pd.api.types.is_numeric_dtype(frame[col]) else float(series.head(50).apply(to_number).notna().mean())
+            if numeric_score < 0.6:
+                continue
+            tokens = set(tokenize_text(col))
+            score = len(query_tokens_local & tokens) * 3.0
+            if any(token in tokens for token in ["cgpa", "sgpa", "gpa", "score", "attendance", "credit", "income", "age"]):
+                score += 1.5
+            if score > best_score:
+                best_col = col
+                best_score = score
+        return best_col if best_score >= 3.0 else None
+
+    revenue_col = find_col("revenue") or find_col("sales")
+    profit_col = find_col("profit") or find_col("net", "income") or find_col("income")
+    expense_col = find_col("expense") or find_col("cost")
+    units_col = find_col("units", "sold") or find_col("quantity") or find_col("qty")
+    market_share_col = find_col("market", "share") or find_col("share")
+    order_date_col = find_col("order", "date") or find_col("date")
+    year_col = next((orig for lower, orig in cols_lower.items() if lower == "year" or "year" in lower), None)
+
+    metric_col = None
+    if any(token in q for token in ["sales", "sale", "revenue"]):
+        metric_col = revenue_col
+    elif "profit" in q:
+        metric_col = profit_col
+    elif any(token in q for token in ["expense", "expenses", "cost"]):
+        metric_col = expense_col
+    elif any(token in q for token in ["units", "quantity", "sold"]):
+        metric_col = units_col
+    elif any(token in q for token in ["market share", "share"]):
+        metric_col = market_share_col
+    metric_col = metric_col or detect_generic_metric_column(working_df)
+    if not metric_col or metric_col not in working_df.columns:
+        return []
+
+    current = working_df.copy()
+    current[metric_col] = current[metric_col].apply(to_number)
+    current = current.dropna(subset=[metric_col])
+    if current.empty:
+        return []
+
+    dim_key, dim_col = resolve_dimension_column(current, q)
+    if dim_col:
+        requested_dim_value = infer_value_from_column(dim_col)
+        if requested_dim_value and not any(token in q for token in [f"by {dim_key}", f"per {dim_key}", f"{dim_key} breakdown", f"grouped by {dim_key}"]):
+            current = apply_text_filter(current, dim_col, requested_dim_value)
+            if current.empty:
+                return []
+
+    if order_date_col and order_date_col in current.columns:
+        current[order_date_col] = pd.to_datetime(current[order_date_col], errors="coerce")
+        rel_window = detect_relative_time_window(q)
+        if rel_window and current[order_date_col].notna().any():
+            amount, unit = rel_window
+            end_date = current[order_date_col].max()
+            start_date = relative_window_start(end_date, amount, unit)
+            if start_date is not None:
+                current = current[current[order_date_col] >= start_date]
+                if current.empty:
+                    return []
+
+    time_bucket = detect_time_granularity(q)
+    if order_date_col and order_date_col in current.columns and current[order_date_col].notna().any() and time_bucket:
+        if time_bucket == "day":
+            grouped = current.groupby(current[order_date_col].dt.date)[metric_col].sum().sort_index()
+        elif time_bucket == "week":
+            grouped = current.groupby(current[order_date_col].dt.to_period("W").astype(str))[metric_col].sum().sort_index()
+        elif time_bucket == "month":
+            grouped = current.groupby(current[order_date_col].dt.to_period("M").astype(str))[metric_col].sum().sort_index()
+        elif time_bucket == "quarter":
+            grouped = current.groupby(current[order_date_col].dt.to_period("Q").astype(str))[metric_col].sum().sort_index()
+        else:
+            grouped = current.groupby(current[order_date_col].dt.year)[metric_col].sum().sort_index()
+        return [{"label": str(idx), "value": float(val)} for idx, val in grouped.tail(24).items() if pd.notna(val)]
+
+    if year_col and year_col in current.columns and any(token in q for token in ["by year", "yearly", "annual", "annually"]):
+        labels = current[year_col].astype(str).str.extract(r"(20\d{2})", expand=False).fillna(current[year_col].astype(str))
+        grouped = current.groupby(labels)[metric_col].sum().sort_index()
+        return [{"label": str(idx), "value": float(val)} for idx, val in grouped.items() if pd.notna(val)]
+
+    if dim_col and dim_col in current.columns and any(token in q for token in ["by ", "per ", "grouped by", "breakdown", "distribution", "contribution", "compare", "comparison", "top ", "highest", "lowest", "most", "least"]):
+        temp = current.copy()
+        temp[dim_col] = temp[dim_col].astype(str).str.strip()
+        temp = temp[temp[dim_col] != ""]
+        if temp.empty:
+            return []
+        if any(token in q for token in ["count", "number of", "how many"]) and not any(token in q for token in ["sales", "revenue", "profit", "expense", "cost", "units", "quantity"]):
+            grouped = temp.groupby(dim_col).size().sort_values(ascending=False)
+        elif any(token in q for token in ["average", "avg", "mean"]):
+            grouped = temp.groupby(dim_col)[metric_col].mean().sort_values(ascending=False)
+        else:
+            grouped = temp.groupby(dim_col)[metric_col].sum().sort_values(ascending=False)
+        return [{"label": str(idx), "value": float(val)} for idx, val in grouped.head(12).items() if pd.notna(val)]
+
+    return []
+
+
 def build_tabular_chart_data(query, uploaded_files):
     """Build chart-ready label/value pairs directly from tabular data."""
     q = (query or "").strip().lower()
@@ -1484,12 +1787,27 @@ def build_tabular_chart_data(query, uploaded_files):
         "market_share": ["market share", "share"],
     }
     group_aliases = {
-        "country": ["country", "countries", "nation", "region", "location"],
+        "country": ["country", "countries", "nation", "location"],
+        "region": ["region", "regions", "territory", "area", "geography"],
         "product": ["product", "products", "item", "items"],
         "category": ["category", "categories"],
+        "sub_category": ["sub-category", "subcategory", "sub category"],
         "company": ["company", "companies", "firm"],
+        "channel": ["channel", "channels", "sales channel"],
+        "market": ["market", "markets"],
+        "city": ["city", "cities"],
+        "department": ["department", "departments"],
+        "brand": ["brand", "brands"],
+        "supplier": ["supplier", "suppliers"],
+        "vendor": ["vendor", "vendors"],
+        "campaign": ["campaign", "campaigns"],
+        "store": ["store", "stores"],
+        "branch": ["branch", "branches"],
         "year": ["year", "years", "annual"],
-        "month": ["month", "months"],
+        "quarter": ["quarter", "quarters", "q1", "q2", "q3", "q4", "quarterly"],
+        "month": ["month", "months", "monthly"],
+        "week": ["week", "weeks", "weekly"],
+        "day": ["day", "days", "daily"],
     }
 
     def query_mentions(aliases):
@@ -1556,6 +1874,9 @@ def build_tabular_chart_data(query, uploaded_files):
             chart_df = loaded_frames[0][1]
 
     working_df = chart_df.copy()
+    resolved_chart_data = resolve_chart_data_from_dataframe(query, working_df)
+    if resolved_chart_data:
+        return resolved_chart_data
 
     def find_col(*keywords):
         for col in working_df.columns:
@@ -1567,6 +1888,50 @@ def build_tabular_chart_data(query, uploaded_files):
                 if keyword in str(col).lower():
                     return col
         return None
+
+    def tokenize_text(text):
+        return [token for token in re.findall(r"[a-z0-9]+", str(text or "").lower()) if token]
+
+    def detect_generic_metric_column():
+        query_tokens_local = set(tokenize_text(q))
+        best_col = None
+        best_score = 0.0
+        for col in working_df.columns:
+            series = working_df[col]
+            non_null = series.dropna()
+            if non_null.empty:
+                continue
+            numeric_score = 1.0 if pd.api.types.is_numeric_dtype(series) else float(non_null.head(50).apply(to_number).notna().mean())
+            if numeric_score < 0.6:
+                continue
+            tokens = set(tokenize_text(col))
+            score = len(query_tokens_local & tokens) * 3.0
+            if any(token in tokens for token in ["cgpa", "sgpa", "gpa", "score", "attendance", "credit", "income", "age"]):
+                score += 1.5
+            if score > best_score:
+                best_col = col
+                best_score = score
+        return best_col if best_score >= 3.0 else None
+
+    def detect_generic_group_column():
+        query_tokens_local = set(tokenize_text(q))
+        best_col = None
+        best_score = 0.0
+        for col in working_df.columns:
+            series = working_df[col].dropna().astype(str).str.strip()
+            if series.empty:
+                continue
+            unique_ratio = float(series.nunique()) / max(len(series), 1)
+            if unique_ratio >= 0.9:
+                continue
+            tokens = set(tokenize_text(col))
+            score = len(query_tokens_local & tokens) * 3.0
+            if any(token in tokens for token in ["gender", "program", "category", "department", "country", "region", "semester", "status"]):
+                score += 1.0
+            if score > best_score:
+                best_col = col
+                best_score = score
+        return best_col if best_score >= 3.0 else None
 
     def metric_requested():
         if query_mentions(metric_aliases["market_share"]):
@@ -1588,9 +1953,40 @@ def build_tabular_chart_data(query, uploaded_files):
     market_share_col = find_col("market", "share") or find_col("share")
     company_col = find_col("company") or find_col("firm")
     country_col = find_col("country") or find_col("nation") or find_col("region") or find_col("location")
+    region_col = find_col("region") or find_col("territory") or find_col("area") or find_col("geography")
     product_col = find_col("product") or find_col("item")
     category_col = find_col("category")
+    sub_category_col = find_col("sub", "category") or find_col("subcategory")
+    channel_col = find_col("channel")
+    market_col = find_col("market")
+    city_col = find_col("city")
+    department_col = find_col("department")
+    brand_col = find_col("brand")
+    supplier_col = find_col("supplier")
+    vendor_col = find_col("vendor")
+    campaign_col = find_col("campaign")
+    store_col = find_col("store")
+    branch_col = find_col("branch")
     month_col = find_col("month")
+    date_col = find_col("order", "date") or find_col("date")
+
+    if date_col and date_col in working_df.columns:
+        working_df[date_col] = pd.to_datetime(working_df[date_col], errors="coerce")
+
+    def apply_chart_filters(dataframe):
+        current = dataframe.copy()
+        candidate_columns = [
+            country_col, region_col, product_col, category_col, sub_category_col, company_col,
+            channel_col, market_col, city_col, department_col, brand_col, supplier_col,
+            vendor_col, campaign_col, store_col, branch_col,
+        ]
+        for col_name in [c for c in candidate_columns if c and c in current.columns]:
+            series = current[col_name].dropna().astype(str).str.strip()
+            candidates = sorted({s for s in series if s}, key=len, reverse=True)
+            match_value = next((cand for cand in candidates[:500] if cand.lower() in q), None)
+            if match_value:
+                current = current[current[col_name].astype(str).str.strip().str.lower() == match_value.lower()]
+        return current
 
     if year_col and ("trend" in q or "over time" in q or "by year" in q):
         requested_metric = metric_requested()
@@ -1634,21 +2030,79 @@ def build_tabular_chart_data(query, uploaded_files):
         "count": None,
     }.get(requested_metric)
     if requested_metric is None:
-        metric_col = revenue_col or profit_col or units_col or market_share_col
+        metric_col = detect_generic_metric_column() or revenue_col or profit_col or units_col or market_share_col
+
+    working_df = apply_chart_filters(working_df)
 
     group_col = None
     if query_mentions(group_aliases["country"]):
         group_col = country_col
+    elif query_mentions(group_aliases["region"]):
+        group_col = region_col or country_col
     elif query_mentions(group_aliases["product"]):
         group_col = product_col
     elif query_mentions(group_aliases["category"]):
         group_col = category_col
+    elif query_mentions(group_aliases["sub_category"]):
+        group_col = sub_category_col or category_col
     elif query_mentions(group_aliases["company"]):
         group_col = company_col
+    elif query_mentions(group_aliases["channel"]):
+        group_col = channel_col
+    elif query_mentions(group_aliases["market"]):
+        group_col = market_col
+    elif query_mentions(group_aliases["city"]):
+        group_col = city_col
+    elif query_mentions(group_aliases["department"]):
+        group_col = department_col
+    elif query_mentions(group_aliases["brand"]):
+        group_col = brand_col
+    elif query_mentions(group_aliases["supplier"]):
+        group_col = supplier_col
+    elif query_mentions(group_aliases["vendor"]):
+        group_col = vendor_col
+    elif query_mentions(group_aliases["campaign"]):
+        group_col = campaign_col
+    elif query_mentions(group_aliases["store"]):
+        group_col = store_col
+    elif query_mentions(group_aliases["branch"]):
+        group_col = branch_col
     elif year_col and query_mentions(group_aliases["year"]):
         group_col = year_col
     elif month_col and query_mentions(group_aliases["month"]):
         group_col = month_col
+    if group_col is None:
+        group_col = detect_generic_group_column()
+
+    if date_col and date_col in working_df.columns and working_df[date_col].notna().any():
+        if query_mentions(group_aliases["day"]):
+            temp = working_df.copy()
+            if metric_col and metric_col in temp.columns:
+                temp[metric_col] = temp[metric_col].apply(to_number)
+                temp = temp.dropna(subset=[metric_col])
+                grouped = temp.groupby(temp[date_col].dt.date)[metric_col].sum().sort_index()
+                return [{"label": str(idx), "value": float(val)} for idx, val in grouped.tail(30).items()]
+        if query_mentions(group_aliases["week"]):
+            temp = working_df.copy()
+            if metric_col and metric_col in temp.columns:
+                temp[metric_col] = temp[metric_col].apply(to_number)
+                temp = temp.dropna(subset=[metric_col])
+                grouped = temp.groupby(temp[date_col].dt.to_period("W").astype(str))[metric_col].sum().sort_index()
+                return [{"label": str(idx), "value": float(val)} for idx, val in grouped.tail(20).items()]
+        if query_mentions(group_aliases["month"]) or "trend" in q or "over time" in q:
+            temp = working_df.copy()
+            if metric_col and metric_col in temp.columns:
+                temp[metric_col] = temp[metric_col].apply(to_number)
+                temp = temp.dropna(subset=[metric_col])
+                grouped = temp.groupby(temp[date_col].dt.to_period("M").astype(str))[metric_col].sum().sort_index()
+                return [{"label": str(idx), "value": float(val)} for idx, val in grouped.tail(24).items()]
+        if query_mentions(group_aliases["quarter"]):
+            temp = working_df.copy()
+            if metric_col and metric_col in temp.columns:
+                temp[metric_col] = temp[metric_col].apply(to_number)
+                temp = temp.dropna(subset=[metric_col])
+                grouped = temp.groupby(temp[date_col].dt.to_period("Q").astype(str))[metric_col].sum().sort_index()
+                return [{"label": str(idx), "value": float(val)} for idx, val in grouped.tail(16).items()]
 
     if group_col and group_col in working_df.columns:
         temp = working_df.copy()
@@ -1658,7 +2112,7 @@ def build_tabular_chart_data(query, uploaded_files):
             return []
 
         if metric_col and metric_col in temp.columns:
-            temp[metric_col] = temp[metric_col].apply(to_number)
+            temp[metric_col] = pd.to_numeric(temp[metric_col].apply(to_number), errors="coerce")
             temp = temp.dropna(subset=[metric_col])
             if temp.empty:
                 return []
@@ -1668,18 +2122,8 @@ def build_tabular_chart_data(query, uploaded_files):
         else:
             return []
 
-        return [{"label": str(idx), "value": float(val)} for idx, val in grouped.head(10).items()]
-
-    fallback_metric = metric_col or revenue_col or profit_col or units_col or market_share_col
-    if fallback_metric and fallback_metric in working_df.columns:
-        temp = working_df[[fallback_metric]].copy()
-        temp[fallback_metric] = temp[fallback_metric].apply(to_number)
-        temp = temp.dropna(subset=[fallback_metric])
-        if not temp.empty:
-            return [
-                {"label": f"Row {i + 1}", "value": float(val)}
-                for i, val in enumerate(temp[fallback_metric].head(10).tolist())
-            ]
+        limited = grouped.head(10) if group_col not in {year_col, month_col, date_col} else grouped
+        return [{"label": str(idx), "value": float(val)} for idx, val in limited.items()]
 
     return []
 
@@ -1890,11 +2334,60 @@ def answer_calculation(query, df, memory=None):
     
     q = query.lower()
     q = re.sub(r"\bsale\b", "sales", q)
+    q = re.sub(r"\s+", " ", q).strip()
+
+    phrase_aliases = [
+        (r"\bhow did we perform\b", "sales summary"),
+        (r"\bhow are things looking overall\b", "overall sales trend"),
+        (r"\bhow are we doing overall\b", "overall sales trend"),
+        (r"\bgive me a quick summary of sales trends\b", "sales trend summary"),
+        (r"\bwhat'?s the recent sales trend\b", "sales trend over the past few months"),
+        (r"\bbest month recently\b", "highest sales month in the last 6 months"),
+        (r"\bwhat was our best month recently\b", "highest sales month in the last 6 months"),
+        (r"\bare sales improving or declining\b", "sales trend"),
+        (r"\bare profits going up this year\b", "profit trend this year"),
+        (r"\bwhich country is doing really well\b", "country with highest profit"),
+        (r"\bwhich market is growing fast\b", "fastest growing market"),
+        (r"\bwhat'?s our weakest region\b", "lowest sales region"),
+        (r"\bwhich region is underperforming\b", "lowest sales region"),
+        (r"\bwhich region needs improvement\b", "lowest sales region"),
+        (r"\bwhere are we losing money\b", "country with negative profit"),
+        (r"\bare we losing money somewhere\b", "country with negative profit"),
+        (r"\bwhich category is performing badly\b", "lowest profit category"),
+        (r"\bwhich product is selling the most lately\b", "top product by sales in the last 6 months"),
+        (r"\bbest selling product recent\b", "top product by sales in the last 6 months"),
+        (r"\btop product profit\b", "top product by profit"),
+        (r"\bwhich region bad performance\b", "lowest sales region"),
+        (r"\bwhy profit low\b", "low profit"),
+        (r"\bwhat should i be worried about\b", "sales anomalies"),
+        (r"\bany red flags in the data\b", "sales anomalies"),
+        (r"\bsomething looks off,? check again\b", "sales anomalies"),
+        (r"\bwhat about last year\b", "last year"),
+        (r"\bwhy is this dropping suddenly\b", "explain sales drop"),
+        (r"\bwhat'?s causing this spike\b", "explain sales spike"),
+        (r"\bis this normal\b", "sales volatility"),
+        (r"\bshould i be concerned\b", "sales volatility"),
+        (r"\bytd\b", "this year so far"),
+        (r"\bcountry wise\b", "by country"),
+        (r"\bregion wise\b", "by region"),
+        (r"\bproduct wise\b", "by product"),
+        (r"\bcategory wise\b", "by category"),
+    ]
+    for pattern, replacement in phrase_aliases:
+        q = re.sub(pattern, replacement, q)
+
+    last_focus = memory.get("last_focus") or {}
+    if re.search(r"\bsame for\s+[a-z][a-z ]+$", q) and last_focus.get("metric"):
+        q = f"{last_focus['metric']} {q}"
+    if q.startswith("compare with ") and last_focus.get("metric"):
+        q = f"{last_focus['metric']} {q}"
+
     numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
     if not numeric_cols:
         return None
 
     cols_lower = {c.lower(): c for c in df.columns}
+    schema_lower = [str(c).strip().lower() for c in df.columns]
     year_col = next((orig for lower, orig in cols_lower.items() if lower == "year" or "year" in lower), None)
     profit_or_loss_col = next(
         (
@@ -1925,6 +2418,12 @@ def answer_calculation(query, df, memory=None):
                     return orig
         return None
 
+    def missing_field_message(field_label):
+        return f"Not available in the dataset. No {field_label} field was found."
+
+    def no_matching_data_message(scope_label):
+        return f"No matching data was found for {scope_label}."
+
     revenue_col = find_col("revenue") or find_col("sales")
     profit_col = find_col("profit") or find_col("net", "income") or find_col("income")
     loss_col = find_col("loss")
@@ -1935,6 +2434,8 @@ def answer_calculation(query, df, memory=None):
     expense_col = find_col("expense") or find_col("cost")
     product_col = find_col("product") or find_col("item")
     category_col = find_col("category")
+    region_col = find_col("region") or find_col("territory") or find_col("area") or find_col("geography")
+    gender_col = find_col("gender") or find_col("sex")
     country_col = (
         find_col("country")
         or find_col("nation")
@@ -1942,6 +2443,8 @@ def answer_calculation(query, df, memory=None):
         or find_col("region")
     )
     order_date_col = find_col("order", "date") or find_col("date")
+    current_cgpa_col = find_col("current", "cgpa") or find_col("cgpa")
+    previous_sgpa_col = find_col("previous", "sgpa") or find_col("sgpa")
 
     def aggregate_entity_metric(dataframe, group_col, metric_col, highest=True):
         if not group_col or not metric_col:
@@ -1981,8 +2484,10 @@ def answer_calculation(query, df, memory=None):
             return None
         series = df[text_col].dropna().astype(str).str.strip()
         candidates = sorted({s.lower() for s in series if s}, key=len, reverse=True)
+        q_compact = re.sub(r"[^a-z0-9]+", " ", q.lower()).strip()
         for cand in candidates[:300]:
-            if cand and cand in q:
+            cand_compact = re.sub(r"[^a-z0-9]+", " ", cand).strip()
+            if cand_compact and re.search(rf"\b{re.escape(cand_compact)}\b", q_compact):
                 return cand
         return None
 
@@ -2016,6 +2521,65 @@ def answer_calculation(query, df, memory=None):
             .str.lower()
             .str.contains(re.escape(expected_substring), na=False)
         ]
+
+    def tokenize_text(text):
+        return [token for token in re.findall(r"[a-z0-9]+", str(text or "").lower()) if token]
+
+    def schema_signal_map(dataframe):
+        signals = {}
+        for col in dataframe.columns:
+            col_name = str(col).strip()
+            col_lower = col_name.lower()
+            series = dataframe[col]
+            non_null = series.dropna()
+            numeric_score = 0
+            categorical_score = 0
+            if pd.api.types.is_numeric_dtype(series):
+                numeric_score = 1.0
+            elif not non_null.empty:
+                sample = non_null.head(50).apply(to_number)
+                numeric_score = float(sample.notna().mean())
+            if not non_null.empty:
+                unique_ratio = float(non_null.astype(str).nunique()) / max(len(non_null), 1)
+                categorical_score = 1.0 - min(1.0, unique_ratio)
+            signals[col_name] = {
+                "tokens": set(tokenize_text(col_lower)),
+                "numeric_score": numeric_score,
+                "categorical_score": categorical_score,
+            }
+        return signals
+
+    schema_signals = schema_signal_map(df)
+
+    def detect_metric_column_generic(text):
+        query_tokens_local = set(tokenize_text(text))
+        best_col = None
+        best_score = 0.0
+        for col_name, info in schema_signals.items():
+            if info["numeric_score"] < 0.6:
+                continue
+            score = len(query_tokens_local & info["tokens"]) * 3.0
+            if any(token in info["tokens"] for token in ["cgpa", "sgpa", "gpa", "score", "attendance", "credit", "income", "age", "semester"]):
+                score += 1.5
+            if score > best_score:
+                best_col = col_name
+                best_score = score
+        return best_col if best_score >= 3.0 else None
+
+    def detect_group_column_generic(text):
+        query_tokens_local = set(tokenize_text(text))
+        best_col = None
+        best_score = 0.0
+        for col_name, info in schema_signals.items():
+            if info["categorical_score"] <= 0.0:
+                continue
+            score = len(query_tokens_local & info["tokens"]) * 3.0
+            if any(token in info["tokens"] for token in ["gender", "country", "region", "category", "department", "program", "semester", "status"]):
+                score += 1.0
+            if score > best_score:
+                best_col = col_name
+                best_score = score
+        return best_col if best_score >= 3.0 else None
 
     def parse_threshold_value(raw_value, raw_suffix=""):
         if raw_value is None:
@@ -2272,6 +2836,235 @@ def answer_calculation(query, df, memory=None):
             return int(match.group(1))
         return None
 
+    def detect_relative_time_window(text):
+        text = (text or "").lower()
+        patterns = [
+            r"\b(?:last|past|previous|recent)\s+(\d+)\s+(day|days|week|weeks|month|months|year|years)\b",
+            r"\b(\d+)\s+(day|days|week|weeks|month|months|year|years)\s+(?:back|prior|ago)\b",
+            r"\btrailing\s+(\d+)\s+(day|days|week|weeks|month|months|year|years)\b",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                amount = int(match.group(1))
+                unit = match.group(2).lower()
+                if amount > 0:
+                    return amount, unit
+        return None
+
+    def relative_window_start(end_date, amount, unit):
+        unit = unit.lower()
+        if unit.startswith("day"):
+            return end_date - pd.Timedelta(days=amount)
+        if unit.startswith("week"):
+            return end_date - pd.Timedelta(weeks=amount)
+        if unit.startswith("month"):
+            return end_date - pd.DateOffset(months=amount)
+        if unit.startswith("year"):
+            return end_date - pd.DateOffset(years=amount)
+        return None
+
+    def available_columns_message():
+        visible_cols = ", ".join(str(c) for c in list(df.columns)[:12])
+        if len(df.columns) > 12:
+            visible_cols += ", ..."
+        return f"Column not found for this query. Available columns: {visible_cols}"
+
+    def normalize_group_request():
+        if any(token in q for token in [
+            "by country", "per country", "country wise", "country-wise",
+            "across countries", "for each country", "country breakdown"
+        ]):
+            return "country", country_col
+        if any(token in q for token in [
+            "by product", "per product", "product wise", "product-wise",
+            "for each product"
+        ]):
+            return "product", product_col
+        if any(token in q for token in [
+            "by category", "per category", "category wise", "category-wise",
+            "for each category"
+        ]):
+            return "category", category_col
+        if any(token in q for token in [
+            "by company", "per company", "company wise", "company-wise",
+            "for each company"
+        ]):
+            return "company", company_col
+        if any(token in q for token in [
+            "by month", "per month", "monthly", "month wise", "month-wise"
+        ]):
+            return "month", order_date_col
+        if any(token in q for token in [
+            "by year", "per year", "yearly", "annual", "annually"
+        ]):
+            return "year", order_date_col if order_date_col else year_col
+        generic_group_col = detect_group_column_generic(q)
+        if generic_group_col:
+            return str(generic_group_col).lower(), generic_group_col
+        return None, None
+
+    memory.setdefault("last_focus", {})
+    explicit_group_key, explicit_group_col = normalize_group_request()
+    if explicit_group_key:
+        memory["last_focus"]["group"] = explicit_group_key
+
+    if any(token in q for token in ["last month", "previous month", "recent month"]):
+        memory["last_focus"]["time_phrase"] = "last month"
+    elif any(token in q for token in ["last quarter", "previous quarter", "recent quarter"]):
+        memory["last_focus"]["time_phrase"] = "last quarter"
+    elif any(token in q for token in ["this year so far", "year to date"]):
+        memory["last_focus"]["time_phrase"] = "this year so far"
+    elif any(token in q for token in ["first half of the year", "first half", "h1"]):
+        memory["last_focus"]["time_phrase"] = "first half"
+    elif detect_quarter_reference(q) is not None:
+        memory["last_focus"]["time_phrase"] = f"q{detect_quarter_reference(q)}"
+
+    def strict_structured_execution():
+        metric_col = requested_metric_col or detect_metric_column_generic(q)
+        group_key, group_col = normalize_group_request()
+        if group_col is None:
+            group_key, group_col = resolve_dimension_column(df, q)
+
+        wants_average = any(token in q for token in ["average", "avg", "mean"])
+        wants_count = any(token in q for token in ["count", "how many", "number of"])
+        wants_total = any(token in q for token in ["total", "sum"])
+        wants_extreme = any(token in q for token in ["highest", "lowest", "most", "least", "max", "min"])
+
+        if wants_count and group_col and group_col in df.columns:
+            temp = df[[group_col]].copy()
+            temp[group_col] = temp[group_col].astype(str).str.strip()
+            temp = temp[temp[group_col] != ""]
+            if temp.empty:
+                return no_matching_data_message(str(group_key or group_col))
+            grouped = temp.groupby(group_col).size().sort_values(ascending=False)
+            rows = [f"{idx}: {int(val)}" for idx, val in grouped.head(20).items()]
+            return f"Count by {group_key or group_col}: " + "; ".join(rows)
+
+        if metric_col is None and (wants_average or wants_total or wants_extreme):
+            return available_columns_message()
+
+        if metric_col and metric_col in df.columns:
+            metric_series = pd.to_numeric(df[metric_col].apply(to_number), errors="coerce")
+            valid_metric = metric_series.dropna()
+            if valid_metric.empty:
+                return f"Column '{metric_col}' is not numeric enough for this calculation."
+
+            if group_col and group_col in df.columns:
+                temp = pd.DataFrame({group_col: df[group_col], metric_col: metric_series})
+                temp[group_col] = temp[group_col].astype(str).str.strip()
+                temp = temp.dropna(subset=[metric_col])
+                temp = temp[temp[group_col] != ""]
+                if temp.empty:
+                    return no_matching_data_message(str(group_key or group_col))
+                grouped_metric = temp.groupby(group_col)[metric_col]
+                if wants_average:
+                    grouped = grouped_metric.mean().sort_values(ascending=False)
+                    label = f"average {metric_col}"
+                elif wants_total:
+                    grouped = grouped_metric.sum().sort_values(ascending=False)
+                    label = f"total {metric_col}"
+                elif wants_extreme:
+                    grouped = grouped_metric.mean().sort_values(ascending=False)
+                    top = grouped.index[0]
+                    bottom = grouped.index[-1]
+                    if any(token in q for token in ["lowest", "least", "min"]):
+                        return f"{bottom} has the lowest average {metric_col} ({fmt_num(grouped.loc[bottom])})."
+                    return f"{top} has the highest average {metric_col} ({fmt_num(grouped.loc[top])})."
+                else:
+                    grouped = grouped_metric.mean().sort_values(ascending=False)
+                    label = f"average {metric_col}"
+                rows = [f"{idx}: {fmt_num(val)}" for idx, val in grouped.head(20).items()]
+                return f"{label.title()} by {group_key or group_col}: " + "; ".join(rows)
+
+            if wants_average:
+                return f"The average {metric_col} is {fmt_num(valid_metric.mean())}."
+            if wants_total:
+                return f"The total {metric_col} is {fmt_num(valid_metric.sum())}."
+            if any(token in q for token in ["highest", "max", "most"]):
+                return f"The highest {metric_col} is {fmt_num(valid_metric.max())}."
+            if any(token in q for token in ["lowest", "min", "least"]):
+                return f"The lowest {metric_col} is {fmt_num(valid_metric.min())}."
+        return None
+
+    def detect_time_granularity(text):
+        text = (text or "").lower()
+        if any(token in text for token in ["daily", "by day", "per day", "day wise", "day-wise"]):
+            return "day"
+        if any(token in text for token in ["weekly", "by week", "per week", "week wise", "week-wise"]):
+            return "week"
+        if any(token in text for token in ["monthly", "by month", "per month", "month wise", "month-wise"]):
+            return "month"
+        if any(token in text for token in ["quarterly", "by quarter", "per quarter", "quarter wise", "quarter-wise"]):
+            return "quarter"
+        if any(token in text for token in ["yearly", "annual", "annually", "by year", "per year"]):
+            return "year"
+        return None
+
+    def resolve_dimension_column(dataframe, text):
+        text = (text or "").lower()
+        alias_groups = {
+            "country": ["country", "countries", "nation", "location"],
+            "region": ["region", "regions", "geography", "territory", "area"],
+            "city": ["city", "cities", "town"],
+            "gender": ["gender", "sex"],
+            "market": ["market", "markets"],
+            "product": ["product", "products", "item", "items"],
+            "category": ["category", "categories"],
+            "sub_category": ["sub-category", "subcategory", "sub category"],
+            "customer": ["customer", "customers", "client", "clients"],
+            "segment": ["segment", "segments"],
+            "department": ["department", "departments"],
+            "division": ["division", "divisions"],
+            "brand": ["brand", "brands"],
+            "sku": ["sku", "skus"],
+            "supplier": ["supplier", "suppliers"],
+            "vendor": ["vendor", "vendors"],
+            "campaign": ["campaign", "campaigns"],
+            "channel": ["channel", "channels", "sales channel"],
+            "platform": ["platform", "platforms"],
+            "store": ["store", "stores"],
+            "branch": ["branch", "branches"],
+            "employee": ["employee", "employees", "salesperson", "salespeople", "staff"],
+            "project": ["project", "projects"],
+            "company": ["company", "companies", "firm"],
+            "department": ["department", "departments"],
+        }
+        cols = list(dataframe.columns)
+        lower_map = {str(col).lower(): col for col in cols}
+        for canonical, aliases in alias_groups.items():
+            if not any(alias in text for alias in aliases):
+                continue
+            for alias in aliases + [canonical]:
+                for lower, orig in lower_map.items():
+                    if alias in lower:
+                        return canonical, orig
+        explicit_patterns = [
+            r"(?:grouped|broken down|breakdown|distribution|segmentation|contribution|comparison)\s+by\s+([a-z][a-z _-]+)",
+            r"(?:show|give|list|display|plot|chart)\s+.*?\bby\s+([a-z][a-z _-]+)",
+            r"(?:per|by|across|for each)\s+([a-z][a-z _-]+)",
+        ]
+        for pattern in explicit_patterns:
+            match = re.search(pattern, text)
+            if not match:
+                continue
+            candidate = match.group(1).strip().lower()
+            candidate = re.split(r"\b(?:for|in|over|during|last|past|previous|recent|with|where)\b", candidate)[0].strip(" -_")
+            if not candidate:
+                continue
+            for lower, orig in lower_map.items():
+                if candidate == lower or candidate in lower or lower in candidate:
+                    return candidate, orig
+        generic_group_col = detect_group_column_generic(text)
+        if generic_group_col:
+            return str(generic_group_col).lower(), generic_group_col
+        return None, None
+
+    current_cgpa_col = find_col("current", "cgpa") or find_col("cgpa")
+    previous_sgpa_col = find_col("previous", "sgpa") or find_col("sgpa")
+    attendance_col = find_col("attendance")
+    credit_col = find_col("credit")
+
     metric_map = {
         "revenue": revenue_col,
         "sales": revenue_col or revenue_col,
@@ -2285,6 +3078,13 @@ def answer_calculation(query, df, memory=None):
         "expenses": expense_col,
         "expense": expense_col,
         "cost": expense_col,
+        "cgpa": current_cgpa_col,
+        "current cgpa": current_cgpa_col,
+        "sgpa": previous_sgpa_col,
+        "previous sgpa": previous_sgpa_col,
+        "attendance": attendance_col,
+        "credit": credit_col,
+        "credits": credit_col,
     }
 
     detected_metric_word = detect_metric(q)
@@ -2294,10 +3094,39 @@ def answer_calculation(query, df, memory=None):
         else next((word for word in metric_map if word in q and metric_map[word]), None)
     )
     requested_metric_col = metric_map.get(requested_metric_word) if requested_metric_word else None
+    if requested_metric_col is None:
+        requested_metric_col = detect_metric_column_generic(q)
     mentioned_companies = infer_values_from_column(company_col, limit=4) if company_col else []
     requested_years = detect_years(q)
     requested_year = requested_years[0] if requested_years else None
     company_rollup = build_company_rollup(df) if company_col else None
+    requested_country = infer_value_from_column(country_col) if country_col else None
+    requested_product = infer_value_from_column(product_col) if product_col else None
+    requested_category = infer_value_from_column(category_col) if category_col else None
+    requested_region = infer_value_from_column(region_col) if region_col else None
+    relative_window = detect_relative_time_window(q)
+    if requested_metric_word:
+        memory["last_focus"]["metric"] = requested_metric_word
+    if requested_country:
+        memory["last_focus"]["country"] = requested_country
+    if requested_product:
+        memory["last_focus"]["product"] = requested_product
+    if requested_category:
+        memory["last_focus"]["category"] = requested_category
+    if requested_region:
+        memory["last_focus"]["region"] = requested_region
+    memory["last_focus"].setdefault("group", None)
+    memory["last_focus"].setdefault("time_phrase", None)
+    memory["last_focus"].setdefault("analysis", None)
+
+    if any(token in q for token in ["trend", "over time", "growing", "declining", "improving"]):
+        memory["last_focus"]["analysis"] = "trend"
+    elif any(token in q for token in ["margin", "profit margin"]):
+        memory["last_focus"]["analysis"] = "margin"
+    elif any(token in q for token in ["compare", "vs", "comparison"]):
+        memory["last_focus"]["analysis"] = "comparison"
+    elif any(token in q for token in ["chart", "graph", "plot", "visualize", "visualise"]):
+        memory["last_focus"]["analysis"] = "chart"
 
     def get_company_rollup_metrics(*required_cols):
         if company_rollup is None:
@@ -2313,6 +3142,668 @@ def answer_calculation(query, df, memory=None):
         return temp if not temp.empty else None
 
     order_dates = pd.to_datetime(df[order_date_col], errors="coerce") if order_date_col and order_date_col in df.columns else None
+
+    def latest_period_metric(metric_col, period="month", aggregator="sum"):
+        if order_dates is None or not metric_col or metric_col not in df.columns:
+            return None
+        temp = df[[metric_col]].copy()
+        temp[order_date_col] = order_dates
+        temp[metric_col] = temp[metric_col].apply(to_number)
+        temp = temp[(temp[order_date_col].notna()) & (temp[metric_col].notna())]
+        if temp.empty:
+            return None
+        if period == "month":
+            grouped = temp.groupby(temp[order_date_col].dt.to_period("M"))[metric_col]
+        elif period == "quarter":
+            grouped = temp.groupby(temp[order_date_col].dt.to_period("Q"))[metric_col]
+        elif period == "year":
+            grouped = temp.groupby(temp[order_date_col].dt.year)[metric_col]
+        else:
+            return None
+        series = grouped.mean() if aggregator == "mean" else grouped.sum()
+        if series.empty:
+            return None
+        return series.sort_index()
+
+    def summarize_numeric_series(series, label):
+        series = pd.to_numeric(series, errors="coerce").dropna()
+        if series.empty:
+            return None
+        mean_val = float(series.mean())
+        std_val = float(series.std(ddof=0)) if len(series) > 1 else 0.0
+        var_val = float(series.var(ddof=0)) if len(series) > 1 else 0.0
+        cv = (std_val / abs(mean_val)) if abs(mean_val) > 1e-9 else None
+        return {
+            "label": label,
+            "mean": mean_val,
+            "std": std_val,
+            "var": var_val,
+            "cv": cv,
+            "min": float(series.min()),
+            "max": float(series.max()),
+            "count": int(series.shape[0]),
+        }
+
+    def build_time_metric_series(metric_col, freq="M"):
+        if order_dates is None or not metric_col or metric_col not in df.columns:
+            return None
+        temp = df[[metric_col]].copy()
+        temp[order_date_col] = order_dates
+        temp[metric_col] = temp[metric_col].apply(to_number)
+        temp = temp[(temp[order_date_col].notna()) & (temp[metric_col].notna())]
+        if temp.empty:
+            return None
+        grouped = temp.groupby(temp[order_date_col].dt.to_period(freq))[metric_col].sum().sort_index()
+        return grouped if not grouped.empty else None
+
+    def describe_volatility(metric_col):
+        freq = "M"
+        if any(token in q for token in ["daily", "day"]):
+            freq = "D"
+        elif any(token in q for token in ["weekly", "week"]):
+            freq = "W"
+        elif any(token in q for token in ["quarterly", "quarter", "qoq"]):
+            freq = "Q"
+        elif any(token in q for token in ["yearly", "year", "yoy"]):
+            freq = "Y"
+        series = build_time_metric_series(metric_col, freq=freq)
+        if series is None or len(series) < 2:
+            return None
+        stats = summarize_numeric_series(series, metric_col)
+        if not stats:
+            return None
+        cv = stats["cv"]
+        if cv is None:
+            level = "stable"
+        elif cv >= 0.50:
+            level = "highly volatile"
+        elif cv >= 0.25:
+            level = "moderately volatile"
+        else:
+            level = "fairly stable"
+        return (
+            f"{metric_col} is {level} over time. Mean: {fmt_num(stats['mean'])}; "
+            f"standard deviation: {fmt_num(stats['std'])}; variance: {fmt_num(stats['var'])}."
+        )
+
+    def describe_outliers(metric_col):
+        series = pd.to_numeric(df[metric_col].apply(to_number), errors="coerce").dropna() if metric_col and metric_col in df.columns else pd.Series(dtype=float)
+        if series.empty:
+            return None
+        q1 = float(series.quantile(0.25))
+        q3 = float(series.quantile(0.75))
+        iqr = q3 - q1
+        if iqr <= 1e-9:
+            return f"No strong outliers were detected in {metric_col}."
+        lower = q1 - 1.5 * iqr
+        upper = q3 + 1.5 * iqr
+        outliers = series[(series < lower) | (series > upper)]
+        if outliers.empty:
+            return f"No strong outliers were detected in {metric_col}."
+        return (
+            f"Detected {len(outliers):,} outlier rows in {metric_col}. "
+            f"Typical range: {fmt_num(lower)} to {fmt_num(upper)}; "
+            f"extremes: {fmt_num(outliers.min())} to {fmt_num(outliers.max())}."
+        )
+
+    def describe_anomalies(metric_col):
+        series = build_time_metric_series(metric_col, freq="M")
+        if series is None or len(series) < 4:
+            return None
+        mean_val = float(series.mean())
+        std_val = float(series.std(ddof=0))
+        if std_val <= 1e-9:
+            return f"No clear anomalies were detected in {metric_col}."
+        zscores = ((series - mean_val) / std_val).abs()
+        anomalies = zscores[zscores >= 2.0]
+        if anomalies.empty:
+            return f"No clear anomalies were detected in {metric_col}."
+        rows = [f"{str(idx)} ({fmt_num(series.loc[idx])})" for idx in anomalies.sort_values(ascending=False).index[:5]]
+        return f"Potential anomalies in {metric_col}: " + "; ".join(rows) + "."
+
+    def describe_seasonality(metric_col):
+        series = build_time_metric_series(metric_col, freq="M")
+        if series is None or len(series) < 12:
+            return None
+        month_avg = series.groupby(series.index.month).mean()
+        if month_avg.empty:
+            return None
+        top_month = int(month_avg.idxmax())
+        low_month = int(month_avg.idxmin())
+        top_name = next(name.title() for name, num in month_names.items() if num == top_month)
+        low_name = next(name.title() for name, num in month_names.items() if num == low_month)
+        return (
+            f"{metric_col} shows seasonality. Strongest month on average: {top_name} ({fmt_num(month_avg.loc[top_month])}); "
+            f"weakest month: {low_name} ({fmt_num(month_avg.loc[low_month])})."
+        )
+
+    def describe_forecast(metric_col):
+        freq = "M"
+        horizon_label = "next period"
+        if any(token in q for token in ["next year", "forecast year", "prediction year"]):
+            freq = "Y"
+            horizon_label = "next year"
+        elif any(token in q for token in ["next quarter", "forecast quarter", "prediction quarter"]):
+            freq = "Q"
+            horizon_label = "next quarter"
+        elif any(token in q for token in ["next month", "forecast month", "prediction month"]):
+            freq = "M"
+            horizon_label = "next month"
+        series = build_time_metric_series(metric_col, freq=freq)
+        if series is None or len(series) < 2:
+            return None
+        y = series.astype(float).values
+        x = np.arange(len(y), dtype=float)
+        slope, intercept = np.polyfit(x, y, 1)
+        forecast_value = intercept + slope * len(y)
+        last_period = str(series.index[-1])
+        direction = "upward" if slope > 0 else ("downward" if slope < 0 else "flat")
+        return (
+            f"Simple forecast for {metric_col}: {fmt_num(forecast_value)} for the {horizon_label}, "
+            f"based on a {direction} trend from historical data through {last_period}."
+        )
+
+    def calc_ratio_by_group(numerator_col, denominator_col, group_col, ratio_name):
+        if not numerator_col or not denominator_col or not group_col:
+            return None
+        if numerator_col not in df.columns or denominator_col not in df.columns or group_col not in df.columns:
+            return None
+        temp = df[[group_col, numerator_col, denominator_col]].copy()
+        temp[group_col] = temp[group_col].astype(str).str.strip()
+        temp[numerator_col] = temp[numerator_col].apply(to_number)
+        temp[denominator_col] = temp[denominator_col].apply(to_number)
+        temp = temp.dropna(subset=[group_col, numerator_col, denominator_col])
+        temp = temp[(temp[group_col] != "") & (temp[denominator_col] != 0)]
+        if temp.empty:
+            return None
+        grouped = temp.groupby(group_col)[[numerator_col, denominator_col]].sum()
+        grouped = grouped[grouped[denominator_col] != 0]
+        if grouped.empty:
+            return None
+        grouped[ratio_name] = grouped[numerator_col] / grouped[denominator_col]
+        return grouped.sort_values(by=ratio_name, ascending=False)
+
+    def explain_time_event(metric_col):
+        freq = "Q" if any(token in q for token in ["q1", "q2", "q3", "q4", "quarter"]) else "M"
+        series = build_time_metric_series(metric_col, freq=freq)
+        if series is None or len(series) < 2:
+            return None
+        delta = series.diff().dropna()
+        if delta.empty:
+            return None
+        wants_drop = any(token in q for token in ["drop", "decline", "decrease", "fall"])
+        wants_spike = any(token in q for token in ["spike", "increase", "jump", "surge", "peak"])
+        if wants_drop:
+            event_period = delta.idxmin()
+            change = float(delta.loc[event_period])
+        elif wants_spike:
+            event_period = delta.idxmax()
+            change = float(delta.loc[event_period])
+        else:
+            return None
+        period_value = float(series.loc[event_period])
+        prev_idx = series.index.get_loc(event_period) - 1
+        if prev_idx < 0:
+            return None
+        prev_period = series.index[prev_idx]
+        prev_value = float(series.loc[prev_period])
+        pct = ((period_value - prev_value) / abs(prev_value) * 100.0) if abs(prev_value) > 1e-9 else None
+        direction_word = "drop" if change < 0 else "spike"
+        pct_text = f" ({pct:.2f}%)" if pct is not None else ""
+        return (
+            f"The biggest {direction_word} in {metric_col} occurred in {event_period}, changing by "
+            f"{fmt_num(change)} from {prev_period} to {event_period}{pct_text}. "
+            f"Previous period: {fmt_num(prev_value)}; current period: {fmt_num(period_value)}."
+        )
+
+    if order_dates is not None and revenue_col:
+        if any(token in q for token in ["best month recently", "our best month recently", "highest sales month in the last 6 months"]):
+            month_series = latest_period_metric(revenue_col, period="month")
+            if month_series is not None and not month_series.empty:
+                recent = month_series.tail(6)
+                best_period = recent.idxmax()
+                return f"{best_period} was the best recent month for {revenue_col} ({fmt_num(recent.loc[best_period])})."
+
+        if any(token in q for token in ["last month", "previous month", "recent month"]) and any(token in q for token in ["sales", "revenue"]):
+            month_series = latest_period_metric(revenue_col, period="month")
+            if month_series is not None and not month_series.empty:
+                last_period = month_series.index[-1]
+                return f"Total {revenue_col} in {last_period} is {fmt_num(month_series.iloc[-1])}."
+
+        if any(token in q for token in ["last quarter", "previous quarter", "recent quarter"]) and any(token in q for token in ["sales", "revenue", "profit"]):
+            metric_col = profit_col if "profit" in q and profit_col else revenue_col
+            quarter_series = latest_period_metric(metric_col, period="quarter")
+            if quarter_series is not None and not quarter_series.empty:
+                last_period = quarter_series.index[-1]
+                return f"Total {metric_col} in {last_period} is {fmt_num(quarter_series.iloc[-1])}."
+
+        if "last year" in q and any(token in q for token in ["sales", "revenue", "profit"]):
+            metric_col = profit_col if "profit" in q and profit_col else revenue_col
+            year_series = latest_period_metric(metric_col, period="year")
+            if year_series is not None and not year_series.empty:
+                last_year = year_series.index[-1]
+                return f"Total {metric_col} in {int(last_year)} is {fmt_num(year_series.iloc[-1])}."
+
+        if any(token in q for token in ["this year so far", "year to date"]) and any(token in q for token in ["sales", "revenue", "profit"]):
+            metric_col = profit_col if "profit" in q and profit_col else revenue_col
+            year_series = latest_period_metric(metric_col, period="year")
+            if year_series is not None and not year_series.empty:
+                last_year = year_series.index[-1]
+                return f"Total {metric_col} in {int(last_year)} so far is {fmt_num(year_series.iloc[-1])}."
+
+        if any(token in q for token in ["first half of the year", "first half", "h1"]) and any(token in q for token in ["sales", "revenue", "profit"]):
+            metric_col = profit_col if "profit" in q and profit_col else revenue_col
+            temp = df[[metric_col]].copy()
+            temp[order_date_col] = order_dates
+            temp[metric_col] = temp[metric_col].apply(to_number)
+            temp = temp[(temp[order_date_col].notna()) & (temp[metric_col].notna())]
+            if not temp.empty:
+                latest_year = int(temp[order_date_col].dt.year.max())
+                h1 = temp[(temp[order_date_col].dt.year == latest_year) & (temp[order_date_col].dt.month <= 6)]
+                if not h1.empty:
+                    return f"Total {metric_col} in H1 {latest_year} is {fmt_num(h1[metric_col].sum())}."
+
+        if any(token in q for token in ["top product by sales in the last 6 months", "top product by sales lately"]):
+            metric_col = revenue_col
+            if product_col and metric_col:
+                temp = df[[product_col, metric_col]].copy()
+                temp[order_date_col] = order_dates
+                temp[metric_col] = temp[metric_col].apply(to_number)
+                temp[product_col] = temp[product_col].astype(str).str.strip()
+                temp = temp[(temp[order_date_col].notna()) & (temp[metric_col].notna()) & (temp[product_col] != "")]
+                if not temp.empty:
+                    end_date = temp[order_date_col].max()
+                    start_date = end_date - pd.DateOffset(months=6)
+                    temp = temp[temp[order_date_col] >= start_date]
+                    grouped = temp.groupby(product_col)[metric_col].sum().sort_values(ascending=False)
+                    if not grouped.empty:
+                        return f"{grouped.index[0]} is the top-selling product in the last 6 months ({fmt_num(grouped.iloc[0])})."
+
+    if order_dates is not None and revenue_col and relative_window and any(token in q for token in ["sales", "sale", "revenue"]):
+        amount, unit = relative_window
+        temp = df.copy()
+        temp[order_date_col] = order_dates
+        temp[revenue_col] = temp[revenue_col].apply(to_number)
+        temp = temp[(temp[order_date_col].notna()) & (temp[revenue_col].notna())]
+        if not temp.empty:
+            for col_name, requested_value in [
+                (country_col, requested_country),
+                (product_col, requested_product),
+                (category_col, requested_category),
+            ]:
+                if col_name and requested_value:
+                    temp = apply_text_filter(temp, col_name, requested_value)
+            if not temp.empty:
+                end_date = temp[order_date_col].max()
+                start_date = relative_window_start(end_date, amount, unit)
+                if start_date is not None:
+                    window = temp[temp[order_date_col] >= start_date].copy()
+                    if not window.empty:
+                        group_key, group_col = normalize_group_request()
+                        if group_key == "country" and group_col:
+                            window[group_col] = window[group_col].astype(str).str.strip()
+                            window = window[window[group_col] != ""]
+                            grouped = window.groupby(group_col)[revenue_col].sum().sort_values(ascending=False)
+                            if not grouped.empty:
+                                rows = [f"{idx}: {fmt_num(val)}" for idx, val in grouped.items()]
+                                return (
+                                    f"Total {revenue_col} by country for the last {amount} {unit} "
+                                    f"({start_date.date()} to {end_date.date()}): " + "; ".join(rows[:20])
+                                )
+                        if group_key == "month":
+                            grouped = window.groupby(window[order_date_col].dt.to_period("M"))[revenue_col].sum().sort_index()
+                            if not grouped.empty:
+                                rows = [f"{str(idx)}: {fmt_num(val)}" for idx, val in grouped.items()]
+                                return (
+                                    f"Total {revenue_col} by month for the last {amount} {unit} "
+                                    f"({start_date.date()} to {end_date.date()}): " + "; ".join(rows[:20])
+                                )
+                        if group_key == "year":
+                            grouped = window.groupby(window[order_date_col].dt.year)[revenue_col].sum().sort_index()
+                            if not grouped.empty:
+                                rows = [f"{int(idx)}: {fmt_num(val)}" for idx, val in grouped.items()]
+                                return (
+                                    f"Total {revenue_col} by year for the last {amount} {unit} "
+                                    f"({start_date.date()} to {end_date.date()}): " + "; ".join(rows[:20])
+                                )
+                        scope_bits = []
+                        if requested_country:
+                            scope_bits.append(requested_country.title())
+                        if requested_product:
+                            scope_bits.append(requested_product.title())
+                        if requested_category:
+                            scope_bits.append(requested_category.title())
+                        scope_text = f" for {' / '.join(scope_bits)}" if scope_bits else ""
+                        return (
+                            f"Total {revenue_col}{scope_text} in the last {amount} {unit} "
+                            f"({start_date.date()} to {end_date.date()}) is {fmt_num(window[revenue_col].sum())}."
+                        )
+
+    if revenue_col and any(token in q for token in ["minimum and maximum", "maximum and minimum", "min and max", "max and min"]):
+        sales_series = df[revenue_col].apply(to_number).dropna()
+        if not sales_series.empty:
+            return (
+                f"The minimum {revenue_col} is {fmt_num(sales_series.min())} and "
+                f"the maximum {revenue_col} is {fmt_num(sales_series.max())}."
+            )
+
+    analytic_metric_col = requested_metric_col or revenue_col or profit_col or expense_col or loss_col
+    if analytic_metric_col:
+        if any(token in q for token in ["outlier", "outliers"]):
+            outlier_answer = describe_outliers(analytic_metric_col)
+            if outlier_answer:
+                return outlier_answer
+        if any(token in q for token in ["anomaly", "anomalies", "spike", "spikes"]):
+            anomaly_answer = describe_anomalies(analytic_metric_col)
+            if anomaly_answer:
+                return anomaly_answer
+        if any(token in q for token in ["volatility", "volatile"]):
+            volatility_answer = describe_volatility(analytic_metric_col)
+            if volatility_answer:
+                return volatility_answer
+        if any(token in q for token in ["consistency", "consistent", "stability", "stable"]) and "retrieval" not in q:
+            stability_answer = describe_volatility(analytic_metric_col)
+            if stability_answer:
+                return stability_answer.replace("highly volatile", "inconsistent").replace("moderately volatile", "moderately consistent").replace("fairly stable", "consistent")
+        if any(token in q for token in ["variance", "dispersion"]):
+            stats = summarize_numeric_series(df[analytic_metric_col].apply(to_number), analytic_metric_col)
+            if stats:
+                return (
+                    f"The variance of {analytic_metric_col} is {fmt_num(stats['var'])}. "
+                    f"Mean: {fmt_num(stats['mean'])}; standard deviation: {fmt_num(stats['std'])}."
+                )
+        if any(token in q for token in ["seasonality", "seasonal", "peak period", "lowest period"]):
+            seasonality_answer = describe_seasonality(analytic_metric_col)
+            if seasonality_answer:
+                return seasonality_answer
+        if any(token in q for token in ["forecast", "prediction", "predict"]):
+            forecast_answer = describe_forecast(analytic_metric_col)
+            if forecast_answer:
+                return forecast_answer
+        if any(token in q for token in ["drop", "decline", "decrease", "fall", "spike", "increase", "jump", "surge"]) and any(token in q for token in ["explain", "why", "reason"]):
+            explanation = explain_time_event(analytic_metric_col)
+            if explanation:
+                return explanation
+
+    ratio_group_key, ratio_group_col = resolve_dimension_column(df, q)
+    if ratio_group_col:
+        if ("margin" in q or "profit margin" in q) and profit_col and revenue_col:
+            margin_grouped = calc_ratio_by_group(profit_col, revenue_col, ratio_group_col, "margin_ratio")
+            if margin_grouped is not None:
+                if any(token in q for token in ["highest", "best", "top", "lowest", "least"]):
+                    ascending = any(token in q for token in ["lowest", "least"])
+                    picked = margin_grouped.sort_values(by="margin_ratio", ascending=ascending).iloc[0]
+                    return (
+                        f"{picked.name} has the {'lowest' if ascending else 'highest'} profit margin by {ratio_group_key} "
+                        f"({picked['margin_ratio'] * 100:.2f}%)."
+                    )
+                rows = [f"{idx}: {row['margin_ratio'] * 100:.2f}%" for idx, row in margin_grouped.head(20).iterrows()]
+                return f"Profit margin by {ratio_group_key}: " + "; ".join(rows)
+        if any(token in q for token in ["roi", "return on investment"]) and profit_col and expense_col:
+            roi_grouped = calc_ratio_by_group(profit_col, expense_col, ratio_group_col, "roi_ratio")
+            if roi_grouped is not None:
+                if any(token in q for token in ["highest", "best", "top", "lowest", "least"]):
+                    ascending = any(token in q for token in ["lowest", "least"])
+                    picked = roi_grouped.sort_values(by="roi_ratio", ascending=ascending).iloc[0]
+                    return (
+                        f"{picked.name} has the {'lowest' if ascending else 'highest'} ROI by {ratio_group_key} "
+                        f"({picked['roi_ratio'] * 100:.2f}%)."
+                    )
+                rows = [f"{idx}: {row['roi_ratio'] * 100:.2f}%" for idx, row in roi_grouped.head(20).iterrows()]
+                return f"ROI by {ratio_group_key}: " + "; ".join(rows)
+        if "efficiency" in q and profit_col and revenue_col:
+            efficiency_grouped = calc_ratio_by_group(profit_col, revenue_col, ratio_group_col, "efficiency_ratio")
+            if efficiency_grouped is not None:
+                if any(token in q for token in ["highest", "best", "top", "lowest", "least"]):
+                    ascending = any(token in q for token in ["lowest", "least"])
+                    picked = efficiency_grouped.sort_values(by="efficiency_ratio", ascending=ascending).iloc[0]
+                    return (
+                        f"{picked.name} has the {'lowest' if ascending else 'highest'} efficiency by {ratio_group_key} "
+                        f"({picked['efficiency_ratio'] * 100:.2f}%)."
+                    )
+                rows = [f"{idx}: {row['efficiency_ratio'] * 100:.2f}%" for idx, row in efficiency_grouped.head(20).iterrows()]
+                return f"Efficiency by {ratio_group_key}: " + "; ".join(rows)
+
+    if country_col and revenue_col and any(token in q for token in ["sales", "revenue"]) and any(token in q for token in ["total", "sum", "amount"]):
+        if requested_country:
+            temp = df[[country_col, revenue_col]].copy()
+            temp = apply_text_filter(temp, country_col, requested_country)
+            temp[revenue_col] = temp[revenue_col].apply(to_number)
+            temp = temp.dropna(subset=[revenue_col])
+            if not temp.empty:
+                return f"Total {revenue_col} for {requested_country.title()} is {fmt_num(temp[revenue_col].sum())}."
+            return f"No data found for {requested_country.title()}."
+
+    if region_col and revenue_col and any(token in q for token in ["sales", "revenue"]) and any(token in q for token in ["total", "sum", "amount"]):
+        if requested_region:
+            temp = df[[region_col, revenue_col]].copy()
+            temp = apply_text_filter(temp, region_col, requested_region)
+            temp[revenue_col] = temp[revenue_col].apply(to_number)
+            temp = temp.dropna(subset=[revenue_col])
+            if not temp.empty:
+                return f"Total {revenue_col} for {requested_region.title()} region is {fmt_num(temp[revenue_col].sum())}."
+            return f"No data found for {requested_region.title()} region."
+
+    if region_col and revenue_col and requested_region and re.search(r"\b(sales|revenue)\s+for\b", q):
+        temp = df[[region_col, revenue_col]].copy()
+        temp = apply_text_filter(temp, region_col, requested_region)
+        temp[revenue_col] = temp[revenue_col].apply(to_number)
+        temp = temp.dropna(subset=[revenue_col])
+        if not temp.empty:
+            return f"Total {revenue_col} for {requested_region.title()} region is {fmt_num(temp[revenue_col].sum())}."
+        return f"No data found for {requested_region.title()} region."
+
+    if category_col and revenue_col and any(token in q for token in ["sales", "revenue"]) and any(token in q for token in ["total", "sum", "amount"]):
+        if requested_category:
+            temp = df[[category_col, revenue_col]].copy()
+            temp = apply_text_filter(temp, category_col, requested_category)
+            temp[revenue_col] = temp[revenue_col].apply(to_number)
+            temp = temp.dropna(subset=[revenue_col])
+            if not temp.empty:
+                return f"Total {revenue_col} for {requested_category.title()} category is {fmt_num(temp[revenue_col].sum())}."
+            return f"No data found for {requested_category.title()} category."
+
+    if category_col and revenue_col and requested_category and re.search(r"\b(sales|revenue)\s+for\b", q):
+        temp = df[[category_col, revenue_col]].copy()
+        temp = apply_text_filter(temp, category_col, requested_category)
+        temp[revenue_col] = temp[revenue_col].apply(to_number)
+        temp = temp.dropna(subset=[revenue_col])
+        if not temp.empty:
+            return f"Total {revenue_col} for {requested_category.title()} category is {fmt_num(temp[revenue_col].sum())}."
+        return f"No data found for {requested_category.title()} category."
+
+    if product_col and revenue_col and any(token in q for token in ["sales", "revenue"]) and any(token in q for token in ["total", "sum", "amount"]):
+        if requested_product:
+            temp = df[[product_col, revenue_col]].copy()
+            temp = apply_text_filter(temp, product_col, requested_product)
+            temp[revenue_col] = temp[revenue_col].apply(to_number)
+            temp = temp.dropna(subset=[revenue_col])
+            if not temp.empty:
+                return f"Total {revenue_col} for {requested_product.title()} product is {fmt_num(temp[revenue_col].sum())}."
+            return f"No data found for {requested_product.title()} product."
+
+    if product_col and revenue_col and requested_product and re.search(r"\b(sales|revenue)\s+for\b", q):
+        temp = df[[product_col, revenue_col]].copy()
+        temp = apply_text_filter(temp, product_col, requested_product)
+        temp[revenue_col] = temp[revenue_col].apply(to_number)
+        temp = temp.dropna(subset=[revenue_col])
+        if not temp.empty:
+            return f"Total {revenue_col} for {requested_product.title()} product is {fmt_num(temp[revenue_col].sum())}."
+        return f"No data found for {requested_product.title()} product."
+
+    if order_dates is not None and country_col and revenue_col and requested_country and "last 6 month" in q and any(token in q for token in ["sales", "sale", "revenue"]):
+        temp = df[[country_col, revenue_col]].copy()
+        temp[order_date_col] = order_dates
+        temp = apply_text_filter(temp, country_col, requested_country)
+        temp[revenue_col] = temp[revenue_col].apply(to_number)
+        temp = temp[(temp[order_date_col].notna()) & (temp[revenue_col].notna())]
+        if not temp.empty:
+            last_date = temp[order_date_col].max()
+            window_start = last_date - pd.DateOffset(months=6)
+            window = temp[temp[order_date_col] >= window_start]
+            if not window.empty:
+                return (
+                    f"Total {revenue_col} for {requested_country.title()} in the last 6 months "
+                    f"({window_start.date()} to {last_date.date()}) is {fmt_num(window[revenue_col].sum())}."
+                )
+
+    if any(word in q for word in freq_words):
+        for label, col_name, requested_value in [
+            ("country", country_col, requested_country),
+            ("product", product_col, requested_product),
+            ("category", category_col, requested_category),
+        ]:
+            if not col_name or label not in q:
+                continue
+            series = df[col_name].dropna().astype(str).str.strip()
+            series = series[series != ""]
+            if series.empty:
+                continue
+            counts = series.value_counts()
+            if counts.empty:
+                continue
+            top_value = str(counts.index[0])
+            top_count = int(counts.iloc[0])
+            return f"{top_value} appears most frequently in {col_name} ({top_count} rows)."
+
+    region_col = find_col("region") or country_col
+
+    if country_col and profit_col and any(token in q for token in ["country with highest profit", "doing really well"]):
+        top = aggregate_entity_metric(df, country_col, profit_col, highest=True)
+        if top:
+            entity, value = top
+            return f"{entity} is doing best by {profit_col} ({fmt_num(value)})."
+
+    if region_col and revenue_col and any(token in q for token in ["lowest sales region", "weakest region", "underperforming region"]):
+        top = aggregate_entity_metric(df, region_col, revenue_col, highest=False)
+        if top:
+            entity, value = top
+            return f"{entity} is the weakest region by {revenue_col} ({fmt_num(value)})."
+
+    if category_col and profit_col and any(token in q for token in ["lowest profit category", "worst category", "badly category"]):
+        top = aggregate_entity_metric(df, category_col, profit_col, highest=False)
+        if top:
+            entity, value = top
+            return f"{entity} is the weakest category by {profit_col} ({fmt_num(value)})."
+
+    if country_col and profit_col and any(token in q for token in ["country with negative profit", "losing money", "making losses"]):
+        temp = df[[country_col, profit_col]].copy()
+        temp[country_col] = temp[country_col].astype(str).str.strip()
+        temp[profit_col] = temp[profit_col].apply(to_number)
+        temp = temp.dropna(subset=[profit_col])
+        temp = temp[temp[country_col] != ""]
+        if not temp.empty:
+            grouped = temp.groupby(country_col)[profit_col].sum().sort_values()
+            negative = grouped[grouped < 0]
+            if not negative.empty:
+                rows = [f"{idx} ({fmt_num(val)})" for idx, val in negative.head(10).items()]
+                return "Countries losing money: " + "; ".join(rows)
+            worst = str(grouped.index[0])
+            return f"No country is loss-making overall. The weakest country by {profit_col} is {worst} ({fmt_num(grouped.iloc[0])})."
+
+    if region_col and profit_col and revenue_col and any(token in q for token in ["highest profit after expenses", "good revenue but poor margins", "poor margins"]):
+        margin_grouped = calc_ratio_by_group(profit_col, revenue_col, region_col, "margin_ratio")
+        if margin_grouped is not None and not margin_grouped.empty:
+            picked = margin_grouped.sort_values(by="margin_ratio").iloc[0]
+            return f"{picked.name} has the weakest margin by region ({picked['margin_ratio'] * 100:.2f}%)."
+
+    if any(token in q for token in ["what should i do next", "next step", "next steps"]):
+        if "trend" in q and revenue_col and order_dates is not None:
+            series = latest_period_metric(revenue_col, period="month")
+            if series is not None and len(series) >= 2:
+                direction = "up" if series.iloc[-1] > series.iloc[0] else ("down" if series.iloc[-1] < series.iloc[0] else "flat")
+                if direction == "down":
+                    return "Sales are trending down, so the next step is to inspect the weakest recent products, regions, or categories and check whether margins are also deteriorating."
+                if direction == "up":
+                    return "Sales are trending up, so the next step is to identify which products or regions are driving growth and confirm that profit margins are staying healthy."
+                return "Sales look fairly stable, so the next step is to compare profit margin, region, and product performance to find where improvement is most likely."
+        if "margin" in q:
+            return "The next step is to compare profit margin by region, category, or product to find where revenue is strong but profitability is weak."
+
+    if product_col and revenue_col and profit_col and any(token in q for token in ["high sales but low profit", "high revenue but low profit"]):
+        temp = df[[product_col, revenue_col, profit_col]].copy()
+        temp[product_col] = temp[product_col].astype(str).str.strip()
+        temp[revenue_col] = temp[revenue_col].apply(to_number)
+        temp[profit_col] = temp[profit_col].apply(to_number)
+        temp = temp.dropna(subset=[revenue_col, profit_col])
+        temp = temp[temp[product_col] != ""]
+        if not temp.empty:
+            grouped = temp.groupby(product_col)[[revenue_col, profit_col]].sum()
+            high_rev = grouped[revenue_col].quantile(0.75)
+            low_profit = grouped[profit_col].quantile(0.25)
+            flagged = grouped[(grouped[revenue_col] >= high_rev) & (grouped[profit_col] <= low_profit)].sort_values(by=[revenue_col, profit_col], ascending=[False, True])
+            if not flagged.empty:
+                best = flagged.iloc[0]
+                return f"{flagged.index[0]} has high {revenue_col} but low {profit_col} ({fmt_num(best[revenue_col])} revenue, {fmt_num(best[profit_col])} profit)."
+            return f"No product stands out as high {revenue_col} but low {profit_col}."
+
+    if category_col and order_dates is not None and revenue_col and profit_col and "growing but not profitable" in q:
+        temp = df[[category_col, revenue_col, profit_col]].copy()
+        temp[order_date_col] = order_dates
+        temp[category_col] = temp[category_col].astype(str).str.strip()
+        temp[revenue_col] = temp[revenue_col].apply(to_number)
+        temp[profit_col] = temp[profit_col].apply(to_number)
+        temp = temp.dropna(subset=[revenue_col, profit_col])
+        temp = temp[(temp[category_col] != "") & (temp[order_date_col].notna())]
+        if not temp.empty:
+            candidates = []
+            for category_name, grp in temp.groupby(category_col):
+                monthly = grp.groupby(grp[order_date_col].dt.to_period("M"))[[revenue_col, profit_col]].sum().sort_index()
+                if len(monthly) < 2:
+                    continue
+                growth = float(monthly[revenue_col].iloc[-1] - monthly[revenue_col].iloc[0])
+                total_profit = float(monthly[profit_col].sum())
+                if growth > 0 and total_profit <= 0:
+                    candidates.append((category_name, growth, total_profit))
+            if candidates:
+                category_name, growth, total_profit = sorted(candidates, key=lambda item: item[1], reverse=True)[0]
+                return f"{category_name} is growing in {revenue_col} but is not profitable overall ({fmt_num(growth)} growth, {fmt_num(total_profit)} total profit)."
+            return "No category is both growing and unprofitable in the available data."
+
+    if product_col and order_dates is not None and revenue_col and any(token in q for token in ["highest growth over time", "growing fastest"]):
+        temp = df[[product_col, revenue_col]].copy()
+        temp[order_date_col] = order_dates
+        temp[product_col] = temp[product_col].astype(str).str.strip()
+        temp[revenue_col] = temp[revenue_col].apply(to_number)
+        temp = temp.dropna(subset=[revenue_col])
+        temp = temp[(temp[product_col] != "") & (temp[order_date_col].notna())]
+        if not temp.empty:
+            growth_rows = []
+            for product_name, grp in temp.groupby(product_col):
+                monthly = grp.groupby(grp[order_date_col].dt.to_period("M"))[revenue_col].sum().sort_index()
+                if len(monthly) < 2:
+                    continue
+                first_val = float(monthly.iloc[0])
+                last_val = float(monthly.iloc[-1])
+                if abs(first_val) < 1e-9:
+                    continue
+                growth_pct = ((last_val - first_val) / abs(first_val)) * 100.0
+                growth_rows.append((product_name, growth_pct))
+            if growth_rows:
+                best_product, best_growth = sorted(growth_rows, key=lambda item: item[1], reverse=True)[0]
+                return f"{best_product} has the highest growth over time in {revenue_col} ({best_growth:.2f}%)."
+
+    if region_col and order_dates is not None and revenue_col and profit_col and "increasing sales but decreasing profit" in q:
+        temp = df[[region_col, revenue_col, profit_col]].copy()
+        temp[order_date_col] = order_dates
+        temp[revenue_col] = temp[revenue_col].apply(to_number)
+        temp[profit_col] = temp[profit_col].apply(to_number)
+        temp[region_col] = temp[region_col].astype(str).str.strip()
+        temp = temp.dropna(subset=[revenue_col, profit_col])
+        temp = temp[(temp[region_col] != "") & (temp[order_date_col].notna())]
+        if not temp.empty:
+            candidates = []
+            for region_name, grp in temp.groupby(region_col):
+                monthly = grp.groupby(grp[order_date_col].dt.to_period("M"))[[revenue_col, profit_col]].sum().sort_index()
+                if len(monthly) < 2:
+                    continue
+                rev_change = float(monthly[revenue_col].iloc[-1] - monthly[revenue_col].iloc[0])
+                prof_change = float(monthly[profit_col].iloc[-1] - monthly[profit_col].iloc[0])
+                if rev_change > 0 and prof_change < 0:
+                    candidates.append((region_name, rev_change, prof_change))
+            if candidates:
+                region_name, rev_change, prof_change = sorted(candidates, key=lambda item: (item[1], item[2]), reverse=True)[0]
+                return f"{region_name} shows increasing {revenue_col} but decreasing {profit_col} ({fmt_num(rev_change)} revenue change, {fmt_num(prof_change)} profit change)."
 
     def dynamic_tabular_fallback():
         """Safe schema-aware fallback for tabular questions not covered by explicit rules."""
@@ -2358,6 +3849,16 @@ def answer_calculation(query, df, memory=None):
             "revenue": revenue_col,
             "sales": revenue_col,
             "profit": profit_col,
+            "net income": profit_col or profit_or_loss_col,
+            "income": profit_col or profit_or_loss_col,
+            "expenses": expense_col,
+            "expense": expense_col,
+            "cost": expense_col,
+            "loss": loss_col or profit_or_loss_col,
+            "assets": assets_col,
+            "asset": assets_col,
+            "liabilities": liabilities_col,
+            "liability": liabilities_col,
             "quantity": quantity_col,
             "units": quantity_col,
             "units sold": quantity_col,
@@ -2370,24 +3871,29 @@ def answer_calculation(query, df, memory=None):
         if metric_key not in metric_candidates:
             metric_key = next((key for key in metric_candidates if key in q and metric_candidates.get(key) is not None), None)
         metric_col = metric_candidates.get(metric_key) if metric_key else None
+        if metric_col is None:
+            metric_col = requested_metric_col or detect_metric_column_generic(q)
         if metric_col is None and any(token in q for token in ["order value", "average order value"]):
             metric_col = revenue_col
             metric_key = "order value"
 
         group_key = None
         group_col = None
-        if any(token in q for token in ["per country", "by country", "country has", "country generates", "country performs"]):
-            group_key, group_col = "country", country_col
-        elif any(token in q for token in ["per product", "by product", "product has", "products sold"]):
-            group_key, group_col = "product", product_col
-        elif any(token in q for token in ["per category", "by category", "category generates"]):
-            group_key, group_col = "category", category_col
-        elif any(token in q for token in ["per company", "by company"]):
-            group_key, group_col = "company", company_col
-        elif any(token in q for token in ["per month", "by month", "which month", "month had", "sales over time", "trend"]):
-            group_key, group_col = "month", order_date_col
-        elif "quarter" in q or detect_quarter_reference(q) is not None or any(token in q for token in ["q1", "q2", "q3", "q4"]):
-            group_key, group_col = "quarter", order_date_col
+        explicit_group_key, explicit_group_col = normalize_group_request()
+        if explicit_group_key and explicit_group_col:
+            group_key, group_col = explicit_group_key, explicit_group_col
+        else:
+            time_bucket = detect_time_granularity(q)
+            if time_bucket and order_date_col:
+                group_key, group_col = time_bucket, order_date_col
+            elif "quarter" in q or detect_quarter_reference(q) is not None or any(token in q for token in ["q1", "q2", "q3", "q4"]):
+                group_key, group_col = "quarter", order_date_col
+            elif "trend" in q and order_date_col:
+                group_key, group_col = "month", order_date_col
+            else:
+                resolved_group_key, resolved_group_col = resolve_dimension_column(temp, q)
+                if resolved_group_col is not None:
+                    group_key, group_col = resolved_group_key, resolved_group_col
 
         if "correlation" in q and metric_col and quantity_col and quantity_col in temp.columns and metric_col in temp.columns:
             corr_frame = temp[[quantity_col, metric_col]].copy()
@@ -2402,16 +3908,25 @@ def answer_calculation(query, df, memory=None):
         if metric_col and metric_col in temp.columns:
             temp[metric_col] = temp[metric_col].apply(to_number)
 
-        if group_key in {"month", "quarter"} and order_date_col and order_date_col in temp.columns:
+        if group_key in {"day", "week", "month", "quarter", "year"} and order_date_col and order_date_col in temp.columns:
             temp = temp[temp[order_date_col].notna()]
             if temp.empty:
                 return "No date-backed rows are available for that question."
-            group_series = temp[order_date_col].dt.month if group_key == "month" else temp[order_date_col].dt.quarter
-            label_map = (
-                lambda idx: next(name.title() for name, num in month_names.items() if num == int(idx))
-                if group_key == "month"
-                else f"Q{int(idx)}"
-            )
+            if group_key == "day":
+                group_series = temp[order_date_col].dt.date
+                label_map = lambda idx: str(idx)
+            elif group_key == "week":
+                group_series = temp[order_date_col].dt.to_period("W").astype(str)
+                label_map = lambda idx: str(idx)
+            elif group_key == "month":
+                group_series = temp[order_date_col].dt.to_period("M").astype(str)
+                label_map = lambda idx: str(idx)
+            elif group_key == "quarter":
+                group_series = temp[order_date_col].dt.to_period("Q").astype(str)
+                label_map = lambda idx: str(idx)
+            else:
+                group_series = temp[order_date_col].dt.year
+                label_map = lambda idx: str(int(idx))
         elif group_col and group_col in temp.columns:
             temp[group_col] = temp[group_col].astype(str).str.strip()
             temp = temp[temp[group_col] != ""]
@@ -2445,6 +3960,10 @@ def answer_calculation(query, df, memory=None):
                     return f"{label_map(idx)} has the {'lowest' if ascending else 'highest'} {agg_label} ({fmt_num(ranked.iloc[0])})."
                 rows = [f"{label_map(idx)} ({fmt_num(val)})" for idx, val in ranked.items()]
                 return f"Top {limit} by {agg_label}: " + "; ".join(rows)
+
+            if any(token in q for token in ["compare", "comparison", "breakdown", "distribution", "segmentation", "contribution"]):
+                rows = [f"{label_map(idx)}: {fmt_num(val)}" for idx, val in grouped.sort_values(ascending=False).items()]
+                return f"{agg_label.title()} by {group_key}: " + "; ".join(rows[:20])
 
             rows = [f"{label_map(idx)}: {fmt_num(val)}" for idx, val in grouped.sort_values(ascending=False).items()]
             return f"{agg_label.title()} per {group_key}: " + "; ".join(rows[:20])
@@ -3415,6 +4934,27 @@ def answer_calculation(query, df, memory=None):
             entity, value = top
             return f"{entity} generates the most {profit_col} ({fmt_num(value)})."
 
+    if country_col and profit_col and any(token in q for token in ["profit by country", "total profit by country", "show total profit by country", "show profit by country"]):
+        temp = df[[country_col, profit_col]].copy()
+        temp[country_col] = temp[country_col].astype(str).str.strip()
+        temp[profit_col] = temp[profit_col].apply(to_number)
+        temp = temp.dropna(subset=[profit_col])
+        temp = temp[temp[country_col] != ""]
+        grouped = temp.groupby(country_col)[profit_col].sum().sort_values(ascending=False)
+        table = build_markdown_table(
+            ["Country", profit_col],
+            [[idx, fmt_num(val)] for idx, val in grouped.items()],
+        )
+        if table:
+            return f"Total profit by country:\n\n{table}"
+        return "Not available in the dataset"
+
+    if country_col and profit_col and any(token in q for token in ["which country performing weak in profit", "weak country in profit", "lowest profit country", "country with lowest profit", "weakest country by profit"]):
+        top = aggregate_entity_metric(df, country_col, profit_col, highest=False)
+        if top:
+            entity, value = top
+            return f"{entity} is the weakest country by {profit_col} ({fmt_num(value)})."
+
     if country_col and revenue_col and ("highest average order value" in q or ("country" in q and "average order value" in q and any(w in q for w in strongest_words))):
         temp = df[[country_col, revenue_col]].copy()
         temp[country_col] = temp[country_col].astype(str).str.strip()
@@ -3488,8 +5028,8 @@ def answer_calculation(query, df, memory=None):
             low_period = str(monthly.idxmin())
             return f"Sales trend is overall {direction}. Highest month: {top_period} ({fmt_num(monthly.max())}). Lowest month: {low_period} ({fmt_num(monthly.min())})."
 
-    if "salesperson" in q:
-        return "Not available in the dataset. No salesperson field was found."
+    if "salesperson" in q and not any("salesperson" in col or "salespeople" in col for col in schema_lower):
+        return missing_field_message("salesperson")
 
     if product_col and country_col and revenue_col and "country" in q and "specific product" in q:
         return "Specify the product name to compare country-level sales for that product."
@@ -3520,11 +5060,11 @@ def answer_calculation(query, df, memory=None):
                 if pd.notna(corr):
                     return f"The correlation between {units_col} and {revenue_col} is {corr:.4f}."
 
-    if "region" in q and ("quarter" in q or detect_quarter_reference(q) is not None or any(token in q for token in ["q1", "q2", "q3", "q4"])):
-        return "Not available in the dataset. No region field was found."
+    if "region" in q and not any("region" in col for col in schema_lower) and ("quarter" in q or detect_quarter_reference(q) is not None or any(token in q for token in ["q1", "q2", "q3", "q4"])):
+        return missing_field_message("region")
 
     if country_col and ("country that does not exist" in q or "country does not exist" in q):
-        return "No matching country was found in the dataset."
+        return no_matching_data_message("that country")
 
     if order_dates is not None and "2050" in q:
         temp = df.copy()
@@ -3656,6 +5196,23 @@ def answer_calculation(query, df, memory=None):
 
     if country_col and revenue_col and "compare" in q and any(word in q for word in ["revenue", "sales"]):
         requested_countries = infer_values_from_column(country_col, limit=4)
+        if product_col and "product" in q and len(requested_countries) >= 2:
+            temp = df[[country_col, product_col, revenue_col]].copy()
+            temp[country_col] = temp[country_col].astype(str).str.strip()
+            temp[product_col] = temp[product_col].astype(str).str.strip()
+            temp[revenue_col] = temp[revenue_col].apply(to_number)
+            temp = temp.dropna(subset=[revenue_col])
+            temp = temp[(temp[country_col] != "") & (temp[product_col] != "")]
+            selected = requested_countries[:2]
+            temp = temp[temp[country_col].isin(selected)]
+            if not temp.empty:
+                grouped = temp.groupby([product_col, country_col])[revenue_col].sum().unstack(fill_value=0)
+                if not grouped.empty:
+                    grouped["gap"] = grouped.max(axis=1) - grouped.min(axis=1)
+                    top_rows = grouped.sort_values("gap", ascending=False).head(8)
+                    display = top_rows.drop(columns=["gap"], errors="ignore").reset_index()
+                    table = build_markdown_table(display.columns.tolist(), display.values.tolist())
+                    return "Sales breakdown by product for the selected countries:\n\n" + table
         if len(requested_countries) >= 2:
             temp = df[[country_col, revenue_col]].copy()
             temp[country_col] = temp[country_col].astype(str).str.strip()
@@ -3677,6 +5234,92 @@ def answer_calculation(query, df, memory=None):
                         answer += f"\n\n{table}"
                     return answer
 
+    if country_col and profit_col and "compare" in q and "profit" in q:
+        requested_countries = infer_values_from_column(country_col, limit=4)
+        if len(requested_countries) >= 2:
+            temp = df[[country_col, profit_col]].copy()
+            temp[country_col] = temp[country_col].astype(str).str.strip()
+            temp[profit_col] = temp[profit_col].apply(to_number)
+            temp = temp.dropna(subset=[profit_col])
+            temp = temp[temp[country_col] != ""]
+            if not temp.empty:
+                grouped = temp.groupby(country_col)[profit_col].sum()
+                selected = [country for country in requested_countries if country in grouped.index]
+                if len(selected) >= 2:
+                    compared = selected[:2]
+                    winner = max(compared, key=lambda country: grouped.loc[country])
+                    table = build_markdown_table(
+                        ["Country", profit_col],
+                        [[country, fmt_num(grouped.loc[country])] for country in compared],
+                    )
+                    answer = f"Profit comparison by country. {winner} is higher."
+                    if table:
+                        answer += f"\n\n{table}"
+                    return answer
+
+    if region_col and revenue_col and any(token in q for token in ["compare", "vs"]) and any(word in q for word in ["sales", "revenue"]):
+        requested_regions = infer_values_from_column(region_col, limit=4)
+        if len(requested_regions) >= 2:
+            if product_col and "product" in q:
+                temp = df[[region_col, product_col, revenue_col]].copy()
+                temp[region_col] = temp[region_col].astype(str).str.strip()
+                temp[product_col] = temp[product_col].astype(str).str.strip()
+                temp[revenue_col] = temp[revenue_col].apply(to_number)
+                temp = temp.dropna(subset=[revenue_col])
+                temp = temp[(temp[region_col] != "") & (temp[product_col] != "")]
+                selected = requested_regions[:2]
+                temp = temp[temp[region_col].isin(selected)]
+                if not temp.empty:
+                    grouped = temp.groupby([product_col, region_col])[revenue_col].sum().unstack(fill_value=0)
+                    if not grouped.empty:
+                        grouped["gap"] = grouped.max(axis=1) - grouped.min(axis=1)
+                        top_rows = grouped.sort_values("gap", ascending=False).head(8)
+                        display = top_rows.drop(columns=["gap"], errors="ignore").reset_index()
+                        table = build_markdown_table(display.columns.tolist(), display.values.tolist())
+                        return "Sales breakdown by product for the selected regions:\n\n" + table
+            temp = df[[region_col, revenue_col]].copy()
+            temp[region_col] = temp[region_col].astype(str).str.strip()
+            temp[revenue_col] = temp[revenue_col].apply(to_number)
+            temp = temp.dropna(subset=[revenue_col])
+            temp = temp[temp[region_col] != ""]
+            if not temp.empty:
+                grouped = temp.groupby(region_col)[revenue_col].sum()
+                selected = [region for region in requested_regions if region in grouped.index]
+                if len(selected) >= 2:
+                    compared = selected[:2]
+                    winner = max(compared, key=lambda region: grouped.loc[region])
+                    table = build_markdown_table(
+                        ["Region", revenue_col],
+                        [[region, fmt_num(grouped.loc[region])] for region in compared],
+                    )
+                    answer = f"Sales comparison by region. {winner} is higher."
+                    if table:
+                        answer += f"\n\n" + table
+                    return answer
+
+    if country_col and revenue_col and any(token in q for token in ["compare", "vs"]) and any(word in q for word in ["sales", "revenue"]):
+        requested_countries = infer_values_from_column(country_col, limit=4)
+        if len(requested_countries) >= 2:
+            temp = df[[country_col, revenue_col]].copy()
+            temp[country_col] = temp[country_col].astype(str).str.strip()
+            temp[revenue_col] = temp[revenue_col].apply(to_number)
+            temp = temp.dropna(subset=[revenue_col])
+            temp = temp[temp[country_col] != ""]
+            if not temp.empty:
+                grouped = temp.groupby(country_col)[revenue_col].sum()
+                selected = [country for country in requested_countries if country in grouped.index]
+                if len(selected) >= 2:
+                    compared = selected[:2]
+                    winner = max(compared, key=lambda country: grouped.loc[country])
+                    table = build_markdown_table(
+                        ["Country", revenue_col],
+                        [[country, fmt_num(grouped.loc[country])] for country in compared],
+                    )
+                    answer = f"Sales comparison by country. {winner} is higher."
+                    if table:
+                        answer += f"\n\n{table}"
+                    return answer
+
     # Comparison-style finance query.
     
     if "compare" in q and revenue_col and profit_col and any(k in q for k in ["revenue", "profit"]):
@@ -3692,7 +5335,31 @@ def answer_calculation(query, df, memory=None):
 
     # Profitability check.
     
-    if any(k in q for k in ["profitable", "profitability"]):
+    if any(k in q for k in ["profitable", "profitability"]) and "growing but not profitable" not in q:
+        if category_col and profit_col and requested_category:
+            temp = df[[category_col, profit_col]].copy()
+            temp = apply_text_filter(temp, category_col, requested_category)
+            temp[profit_col] = temp[profit_col].apply(to_number)
+            temp = temp.dropna(subset=[profit_col])
+            if not temp.empty:
+                total_profit = temp[profit_col].sum()
+                return f"Yes, {requested_category.title()} is profitable." if total_profit > 0 else f"No, {requested_category.title()} is not profitable."
+        if region_col and profit_col and requested_region:
+            temp = df[[region_col, profit_col]].copy()
+            temp = apply_text_filter(temp, region_col, requested_region)
+            temp[profit_col] = temp[profit_col].apply(to_number)
+            temp = temp.dropna(subset=[profit_col])
+            if not temp.empty:
+                total_profit = temp[profit_col].sum()
+                return f"Yes, {requested_region.title()} is profitable." if total_profit > 0 else f"No, {requested_region.title()} is not profitable."
+        if product_col and profit_col and requested_product:
+            temp = df[[product_col, profit_col]].copy()
+            temp = apply_text_filter(temp, product_col, requested_product)
+            temp[profit_col] = temp[profit_col].apply(to_number)
+            temp = temp.dropna(subset=[profit_col])
+            if not temp.empty:
+                total_profit = temp[profit_col].sum()
+                return f"Yes, {requested_product.title()} is profitable." if total_profit > 0 else f"No, {requested_product.title()} is not profitable."
         if profit_col:
             prof_total = df[profit_col].apply(to_number).dropna().sum()
             memory["last_structured_intent"] = "is company"
@@ -3721,6 +5388,26 @@ def answer_calculation(query, df, memory=None):
                 yr = df.loc[idx, year_col]
                 val = valid.loc[idx]
                 return f"{int(yr) if str(yr).replace('.','',1).isdigit() else yr} has the {'highest' if any(k in q for k in ['highest','max']) else 'lowest'} {metric_col} ({fmt_num(val)})."
+
+    if current_cgpa_col and current_cgpa_col in df.columns and "cgpa" in q:
+        cgpa_series = df[current_cgpa_col].apply(to_number).dropna()
+        if not cgpa_series.empty:
+            if gender_col and gender_col in df.columns and ("by gender" in q or "per gender" in q or "gender" in q):
+                temp = df[[gender_col, current_cgpa_col]].copy()
+                temp[current_cgpa_col] = temp[current_cgpa_col].apply(to_number)
+                temp[gender_col] = temp[gender_col].astype(str).str.strip()
+                temp = temp.dropna(subset=[current_cgpa_col])
+                temp = temp[temp[gender_col] != ""]
+                if not temp.empty:
+                    grouped = temp.groupby(gender_col)[current_cgpa_col].mean().sort_values(ascending=False)
+                    rows = [f"{idx}: {fmt_num(val)}" for idx, val in grouped.items()]
+                    return "Average current CGPA by gender: " + "; ".join(rows[:20])
+            if any(token in q for token in ["average", "avg", "mean", "what is"]):
+                return f"The average current CGPA is {fmt_num(cgpa_series.mean())}."
+
+    strict_answer = strict_structured_execution()
+    if strict_answer:
+        return strict_answer
 
     dynamic_answer = dynamic_tabular_fallback()
     if dynamic_answer:
@@ -4316,8 +6003,11 @@ def classify_query(q):
     if is_finance_or_tabular and is_aggregation:
         return "structured"
 
+    # Finance/tabular lookup questions are usually deterministic dataset queries.
+    # Keep them on the structured path so things like "last quarter revenue"
+    # use the pandas logic instead of depending on the LLM route.
     if is_finance_or_tabular and is_lookup:
-        return "semantic"
+        return "structured"
 
     # ---- FINANCE ----
     if is_finance_or_tabular:
@@ -6107,6 +7797,184 @@ def answer_meta_followup(user_query, conversation_memory):
     return None
 
 
+def resolve_structured_followup_query(user_query, conversation_memory):
+    """Expand conversational tabular follow-ups using the previous structured query."""
+    q = (user_query or "").strip()
+    if not q:
+        return q
+
+    last_query = (conversation_memory.get("last_query") or "").strip()
+    if not last_query:
+        return q
+
+    lowered = q.lower()
+    prev_lower = last_query.lower()
+    last_focus = conversation_memory.get("last_focus") or {}
+
+    def infer_target_scope(text):
+        text = (text or "").strip().lower()
+        if not text:
+            return None, None
+        if re.search(r"\b(q[1-4]|last year|this year|last month|last quarter|h1)\b", text):
+            return "time", text
+        preferred = last_focus.get("group") or "country"
+        return preferred, text
+
+    def swap_time_phrase(base_query, target_time):
+        updated = base_query
+        replacements = [
+            (r"\blast month'?s?\b", target_time),
+            (r"\blast quarter\b", target_time),
+            (r"\blast year\b", target_time),
+            (r"\bthis year so far\b", target_time),
+            (r"\byear to date\b", target_time),
+            (r"\bfirst half of the year\b", target_time),
+            (r"\bh1\b", target_time),
+            (r"\bq[1-4]\b", target_time),
+        ]
+        for pattern, replacement in replacements:
+            updated = re.sub(pattern, replacement, updated, flags=re.IGNORECASE)
+        return updated if updated != base_query else f"{base_query} {target_time}"
+
+    metric = last_focus.get("metric") or ("profit" if "profit" in prev_lower else "sales")
+    group = last_focus.get("group")
+    analysis = last_focus.get("analysis")
+    active_scope = (
+        last_focus.get("country")
+        or last_focus.get("region")
+        or last_focus.get("category")
+        or last_focus.get("product")
+    )
+
+    if re.fullmatch(r"(what about|how about)\s+last year\??", lowered):
+        if "this year" in prev_lower:
+            return re.sub(r"\bthis year\b", "last year", last_query, flags=re.IGNORECASE)
+        if "year to date" in prev_lower or "so far" in prev_lower:
+            return f"{last_query} compared with last year"
+        return swap_time_phrase(last_query, "last year")
+
+    if re.fullmatch(r"(what about|how about)\s+(q[1-4]|last month|last quarter|this year|last year|h1)\??", lowered):
+        target = re.sub(r"^(what about|how about)\s+", "", lowered).strip(" ?")
+        return swap_time_phrase(last_query, target)
+
+    if re.fullmatch(r"(what about|how about)\s+(margin|profit margin|profit|revenue|sales|trend|chart)\??", lowered):
+        target = re.sub(r"^(what about|how about)\s+", "", lowered).strip(" ?")
+        if target in {"margin", "profit margin"}:
+            base = f"profit margin"
+            if group:
+                base += f" by {group}"
+            if active_scope:
+                base += f" for {active_scope}"
+            return base
+        if target == "trend":
+            base = f"{metric} trend"
+            if active_scope:
+                base += f" for {active_scope}"
+            return base
+        if target == "chart":
+            return f"{last_query} chart"
+        base = f"{target}"
+        if active_scope:
+            base += f" for {active_scope}"
+        return base
+
+    m_same = re.fullmatch(r"(?:show|give me)?\s*(?:the\s+)?same\s+for\s+([a-z][a-z ]+)\??", lowered)
+    if m_same:
+        target = m_same.group(1).strip()
+        dim_name, dim_value = infer_target_scope(target)
+        if dim_name == "time":
+            return f"{last_query} {dim_value}"
+        if "country has highest sales" in prev_lower or "country has highest revenue" in prev_lower:
+            return f"total sales for {dim_value}"
+        if "country has highest profit" in prev_lower:
+            return f"total profit for {dim_value}"
+        if dim_name in {"country", "region", "product", "category"}:
+            metric = "profit" if "profit" in prev_lower else "sales"
+            group = last_focus.get("group")
+            if group and group != dim_name:
+                return f"{metric} by {group} for {dim_value}"
+            return f"{metric} for {dim_value}"
+        return f"{last_query} for {target}"
+
+    m_compare = re.fullmatch(r"(?:now\s+)?compare with\s+([a-z][a-z ]+)\??", lowered)
+    if m_compare:
+        target = m_compare.group(1).strip()
+        _, dim_value = infer_target_scope(target)
+        if "for " in prev_lower and any(metric in prev_lower for metric in ["sales", "revenue", "profit"]):
+            m_prev_target = re.search(r"\bfor\s+([a-z][a-z ]+)", prev_lower)
+            if m_prev_target:
+                source_target = m_prev_target.group(1).strip()
+                metric = "profit" if "profit" in prev_lower else "sales"
+                return f"compare {source_target} vs {dim_value} {metric}"
+        return f"{last_query} compare with {dim_value}"
+
+    if any(token in lowered for token in ["break it down by", "break this down by", "show more details", "more details"]):
+        if "for " in prev_lower and any(metric in prev_lower for metric in ["sales", "revenue", "profit"]):
+            metric = "profit" if "profit" in prev_lower else "sales"
+            m_prev_target = re.search(r"\bfor\s+([a-z][a-z ]+)", prev_lower)
+            target_scope = f" for {m_prev_target.group(1).strip()}" if m_prev_target else ""
+            if "product" in lowered:
+                return f"{metric} by product{target_scope}"
+            if "category" in lowered:
+                return f"{metric} by category{target_scope}"
+            if "country" in lowered:
+                return f"{metric} by country{target_scope}"
+            if "region" in lowered:
+                return f"{metric} by region{target_scope}"
+        if "product" in lowered:
+            return f"{last_query} by product"
+        if "category" in lowered:
+            return f"{last_query} by category"
+        if "country" in lowered:
+            return f"{last_query} by country"
+        if "region" in lowered:
+            return f"{last_query} by region"
+        return f"{last_query} with more details"
+
+    if any(token in lowered for token in ["show margin", "give me margin", "what's the margin", "what is the margin"]):
+        base = "profit margin"
+        if group:
+            base += f" by {group}"
+        if active_scope:
+            base += f" for {active_scope}"
+        return base
+
+    if any(token in lowered for token in ["is it profitable", "is this profitable", "profitable?"]):
+        if active_scope:
+            return f"is {active_scope} profitable"
+        return f"is the company profitable"
+
+    if any(token in lowered for token in ["give me a chart for this", "show a chart for this", "chart for this", "plot this", "visualize this"]):
+        if "chart" in prev_lower or analysis == "chart":
+            return last_query
+        return f"{last_query} chart"
+
+    if any(token in lowered for token in ["explain this trend", "why is this happening", "can you simplify this"]):
+        if analysis == "trend" or "trend" in prev_lower:
+            return f"{last_query} explain this trend"
+        base = f"{metric} trend"
+        if active_scope:
+            base += f" for {active_scope}"
+        return f"{base} explain this trend"
+
+    if any(token in lowered for token in ["what should i do next", "what next", "next step", "next steps"]):
+        if analysis == "margin":
+            base = f"profit margin"
+            if group:
+                base += f" by {group}"
+            if active_scope:
+                base += f" for {active_scope}"
+            return f"{base} what should i do next"
+        if analysis == "trend" or "trend" in prev_lower:
+            base = f"{metric} trend"
+            if active_scope:
+                base += f" for {active_scope}"
+            return f"{base} what should i do next"
+        return f"{last_query} what should i do next"
+
+    return q
+
+
 def resolve_chart_followup_query(user_query, conversation_memory):
     """Expand short chart follow-ups to the previous analytical/tabular query."""
     q = (user_query or "").strip()
@@ -6162,6 +8030,17 @@ def summarize_chart_data(chart_data, query, chart_type=None):
         for item in top_items
     )
     return f"{intro}\n\nTop values: {leaders}."
+
+
+def chart_fallback_note(query, answer_text=None):
+    """Explain why a chart was not attached for a chart-worthy tabular query."""
+    q = (query or "").lower()
+    answer_lower = str(answer_text or "").lower()
+    if any(token in answer_lower for token in ["not available in the dataset", "no data found", "no matching rows", "that country is not present"]):
+        return "A chart was not generated because matching data was not found for that request."
+    if any(token in q for token in ["chart", "graph", "plot", "visualize", "visualise"]):
+        return "A chart was requested, but the dataset did not expose a clear numeric metric and grouping for a reliable visualization."
+    return "A chart was not generated because the query did not resolve to a reliable numeric grouping."
 
 
 def combine_answers_for_display(answers, queries):
@@ -6638,6 +8517,7 @@ def query():
         return jsonify({"answer": f"Upload failed: {upload_status.get('error') or upload_status.get('message', 'Unknown error.')}"}), 500
 
     conversation_memory = get_session_memory(session_id)
+    user_query = resolve_structured_followup_query(user_query, conversation_memory)
     user_query = resolve_chart_followup_query(user_query, conversation_memory)
     meta_reply = None if detect_visualization(user_query, user_query) else answer_meta_followup(user_query, conversation_memory)
     if meta_reply:
@@ -6651,7 +8531,7 @@ def query():
     
     mode = conversation_memory.get("data_mode")
     gate_query_type = classify_query(user_query)
-    if mode == "tabular" and detect_visualization(user_query, user_query):
+    if mode == "tabular" and should_attach_tabular_chart(user_query):
         chart_data = build_tabular_chart_data(user_query, uploaded_files)
         chart_type = get_chart_type(user_query)
         if chart_data:
@@ -6671,7 +8551,24 @@ def query():
             conversation_memory["last_sources"] = []
             conversation_memory["last_chunks"] = []
             return jsonify(response)
-    if mode == "tabular" and gate_query_type in {"structured", "summary"}:
+        fallback_answer = ensure_confidence_line(chart_fallback_note(user_query), 35.0)
+        conversation_memory["last_query"] = user_query
+        conversation_memory["last_answer"] = fallback_answer
+        conversation_memory["last_confidence"] = 35.0
+        conversation_memory["last_sources"] = []
+        conversation_memory["last_chunks"] = []
+        return jsonify({
+            "answer": fallback_answer,
+            "sources": [],
+            "confidence": 35.0,
+            "chunks": [],
+            "chart_data": None,
+            "chart_type": None,
+        })
+    # Keep tabular datasets on one predictable path.
+    # This avoids simple spreadsheet questions being sent through the
+    # more fragile semantic / retrieval / validation pipeline.
+    if mode == "tabular":
         logging.info("TABULAR MODE -> STRUCTURED QUERY")
         answer, tabular_confidences, tabular_queries = run_structured_query_batch(
             user_query,
@@ -6692,7 +8589,8 @@ def query():
             "chart_data": None,
             "chart_type": None,
         }
-        if detect_visualization(user_query, answer):
+        chart_expected = should_attach_tabular_chart(user_query)
+        if chart_expected:
             try:
                 multi_data = extract_multi_file_data(answer)
                 if multi_data:
@@ -6709,8 +8607,17 @@ def query():
                         chart_type = get_chart_type(user_query)
                         response["chart_data"] = generate_chart(chart_data, chart_type)
                         response["chart_type"] = chart_type
+                    else:
+                        response["answer"] = ensure_confidence_line(
+                            strip_confidence_footer(response["answer"]) + "\n\n" + chart_fallback_note(user_query, answer),
+                            overall_conf,
+                        )
             except Exception as e:
                 logging.info(f"Structured chart generation failed: {e}")
+                response["answer"] = ensure_confidence_line(
+                    strip_confidence_footer(response["answer"]) + "\n\n" + chart_fallback_note(user_query, answer),
+                    overall_conf,
+                )
         if effective_debug:
             response["debug"] = {
                 "mode": "tabular",
@@ -6901,17 +8808,6 @@ def query():
             numeric_query=numeric_query,
         )
 
-        top1_score = safe_float(filtered_results[0].score) if filtered_results else 0.0
-        if top1_score < 0.2:
-            fallback_reason = "weak_retrieval_top1_below_0_2"
-            logging.info(f"Fallback reason: {fallback_reason}")
-            q_debug["top1_score"] = round(top1_score, 3)
-            finalize_question_debug(q_debug, fallback_reason, q_start, effective_debug, debug_questions)
-            answers.append(ensure_confidence_line("No relevant data found", 10.0))
-            part_confidences.append(10.0)
-            continue
-
-
         if not filtered_results:
             fallback_reason = "no_filtered_results_general_fallback"
             logging.info(f"Fallback reason: {fallback_reason}")
@@ -6951,6 +8847,16 @@ def query():
                 answers.append(ensure_confidence_line("Not available in the dataset.", 0.0))
                 part_confidences.append(0.0)
                 continue
+
+        top1_score = safe_float(filtered_results[0].score) if filtered_results else 0.0
+        if top1_score < 0.2:
+            fallback_reason = "weak_retrieval_top1_below_0_2"
+            logging.info(f"Fallback reason: {fallback_reason}")
+            q_debug["top1_score"] = round(top1_score, 3)
+            finalize_question_debug(q_debug, fallback_reason, q_start, effective_debug, debug_questions)
+            answers.append(ensure_confidence_line("No relevant data found", 10.0))
+            part_confidences.append(10.0)
+            continue
 
         logging.info(f"Final confidence score: {confidence_percent}%")
 
@@ -7142,6 +9048,7 @@ def query_stream():
 
     ensure_session_state(session_id)
     conversation_memory = get_session_memory(session_id)
+    user_query = resolve_structured_followup_query(user_query, conversation_memory)
     user_query = resolve_chart_followup_query(user_query, conversation_memory)
     meta_reply = None if detect_visualization(user_query, user_query) else answer_meta_followup(user_query, conversation_memory)
     if meta_reply:
@@ -7151,7 +9058,7 @@ def query_stream():
     query_type = classify_query(user_query)
     numeric_query = detect_numeric_query(user_query)
     metadata_filter = infer_metadata_filters(user_query, session_id)
-    if mode == "tabular" and detect_visualization(user_query, user_query):
+    if mode == "tabular" and should_attach_tabular_chart(user_query):
         chart_data = build_tabular_chart_data(user_query, uploaded_files)
         chart_type = get_chart_type(user_query)
         if chart_data:
@@ -7175,7 +9082,25 @@ def query_stream():
             conversation_memory["last_sources"] = []
             conversation_memory["last_chunks"] = []
             return Response(stream_with_context(generate_visual()), mimetype="application/x-ndjson")
-    if mode == "tabular" and query_type in {"structured", "summary"}:
+        fallback_answer = ensure_confidence_line(chart_fallback_note(user_query), 35.0)
+        def generate_visual_fallback():
+            yield json.dumps(
+                {
+                    "type": "meta",
+                    "sources": [],
+                    "confidence": 35.0,
+                    "chunks": [],
+                }
+            ) + "\n"
+            yield json.dumps({"type": "token", "token": fallback_answer}) + "\n"
+            yield json.dumps({"type": "done"}) + "\n"
+        conversation_memory["last_query"] = user_query
+        conversation_memory["last_answer"] = fallback_answer
+        conversation_memory["last_confidence"] = 35.0
+        conversation_memory["last_sources"] = []
+        conversation_memory["last_chunks"] = []
+        return Response(stream_with_context(generate_visual_fallback()), mimetype="application/x-ndjson")
+    if mode == "tabular":
         answer, structured_confidences, _ = run_structured_query_batch(user_query, uploaded_files, conversation_memory)
         answer, overall_conf = finalize_structured_response(
             answer,
@@ -7193,15 +9118,23 @@ def query_stream():
                     "chunks": [],
                 }
             ) + "\n"
-            if detect_visualization(user_query, answer):
+            chart_expected = should_attach_tabular_chart(user_query)
+            if chart_expected:
                 multi_data = extract_multi_file_data(answer)
                 if multi_data and "results vary across datasets" not in answer.lower():
                     rendered_answer = ensure_confidence_line(
                         strip_confidence_footer(answer) + "\n\nResults vary across datasets.",
                         overall_conf,
                     )
+                elif not multi_data:
+                    chart_data_preview = build_tabular_chart_data(user_query, uploaded_files)
+                    if not chart_data_preview:
+                        rendered_answer = ensure_confidence_line(
+                            strip_confidence_footer(rendered_answer) + "\n\n" + chart_fallback_note(user_query, answer),
+                            overall_conf,
+                        )
             yield json.dumps({"type": "token", "token": rendered_answer}) + "\n"
-            if detect_visualization(user_query, answer):
+            if chart_expected:
                 try:
                     multi_data = extract_multi_file_data(answer)
                     if multi_data:
@@ -7365,6 +9298,20 @@ def query_stream():
 def favicon():
     """Return empty favicon response."""
     return '', 204
+
+@app.route('/undefined')
+def undefined_route_guard():
+    """Gracefully absorb accidental frontend requests to /undefined."""
+    return jsonify({"error": "Unknown frontend route."}), 404
+
+@app.errorhandler(HTTPException)
+def handle_http_exception(e):
+    """Preserve HTTP status codes instead of converting them to 500s."""
+    logging.warning("HTTPException: %s %s", getattr(e, "code", 500), e)
+    if request.path.startswith("/query") or request.path.startswith("/upload") or request.path.startswith("/delete") or request.path.startswith("/files") or request.path == "/undefined":
+        return jsonify({"error": e.description, "code": getattr(e, "code", 500)}), getattr(e, "code", 500)
+    return e
+
 @app.errorhandler(Exception)
 def handle_exception(e):
     """Global JSON error handler for uncaught exceptions."""
